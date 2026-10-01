@@ -23,11 +23,6 @@ on:
         default: true
         required: false
         type: boolean
-      enable_terraform_docs:
-        description: 'Enable terraform-docs to generate documentation'
-        default: true
-        required: false
-        type: boolean
       enable_terraform_fmt:
         description: 'Enable terraform fmt to format code'
         default: true
@@ -102,11 +97,6 @@ on:
       tflint_version:
         description: 'Tflint version to use in github action'
         default: 'latest'
-        required: false
-        type: string
-      terraform_docs_format:
-        description: 'terraform-docs output format, "markdown table" or "markdown document". Table is the better fit for modules sourced over OCI: terraform-docs derives a module version only from a "?ref=" source, so an OCI "?tag=" source leaves the version empty. In document format that renders as a dangling "Version:" heading with nothing after it; in a table it is simply an empty cell, and the version is still readable at the end of the source string.'
-        default: 'markdown table'
         required: false
         type: string
       trivy_version:
@@ -311,72 +301,13 @@ jobs:
           git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             "HEAD:refs/heads/${BRANCH}"
 
-  terraform-docs:
-    needs:
-      - terraform-fmt
-    if: ${{ inputs.enable_terraform_docs && (needs.terraform-fmt.result == 'skipped' || needs.terraform-fmt.outputs.diff_exists == 'false') }}
-    runs-on: ${{ inputs.github_runner }}
-    outputs:
-      docs_status: ${{ steps.docs.outcome }}
-      diff_exists: ${{ steps.docs.outputs.num_changed > 0 }}
-
-    env:
-      # the secrets context cannot be read from a step level if, so it is surfaced
-      # here as a plain value that a step condition can test
-      GH_APP_CONFIGURED: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_PRIVATE_KEY != '' }}
-    steps:
-      # Skipped rather than allowed to fail when no app is configured. continue-on-error
-      # stops the failure but not the error annotation, so every run of a repository that
-      # does not use private modules showed red errors on an otherwise green result, which
-      # teaches people to ignore annotations.
-      - name: Get Github Access Token
-        id: github_app_token
-        if: env.GH_APP_CONFIGURED == 'true'
-        continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
-        with:
-          client-id: ${{ secrets.GH_APP_ID }}
-          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ secrets.MODULE_REPOS }}
-
-      - name: Set Private Module Access Token
-        if: env.GH_APP_CONFIGURED == 'true'
-        run: |
-          git config --global url."https://x-access-token:${{ steps.github_app_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.pull_request.head.ref || github.ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # Ensure that the checkout action does not persist credentials to not override private module access
-          persist-credentials: false
-
-      - name: Run Terraform Docs
-        id: docs
-        uses: terraform-docs/gh-actions@6de6da0cefcc6b4b7a5cbea4d79d97060733093c # v1.4.1
-        with:
-          working-dir: ${{ inputs.terraform_working_directory }}
-          output-file: README.md
-          output-method: inject
-          output-format: ${{ inputs.terraform_docs_format }}
-          args: --sort-by required --anchor=false
-          git-push: true
-          git-push-user-name: ${{ inputs.commit_user }}
-          git-push-user-email: ${{ inputs.commit_email }}
-          git-commit-message: "docs(terraform-docs): update tfdocs"
-          # Note: This action (terraform-docs/gh-actions) will automatically use the
-          # token from the 'checkout' step for its git operations.
-
   terraform-lint:
     needs:
       - terraform-fmt
-      - terraform-docs
-    # this job should only run if there are no new commits caused by terraform-fmt or terraform-docs
-    # if terraform-docs is disabled, it should only run if terraform-fmt caused no changes
+    # this job should only run if there are no new commits caused by terraform-fmt
+    # should only run if terraform-fmt caused no changes
     # if terraform-fmt is disabled, it should run unconditionally
-    if: ${{ always() && !failure() && !cancelled() && (needs.terraform-fmt.result == 'skipped' || needs.terraform-fmt.outputs.diff_exists == 'false') && (!inputs.enable_terraform_docs || needs.terraform-docs.result == 'skipped' || needs.terraform-docs.outputs.diff_exists == 'false') }}
+    if: ${{ always() && !failure() && !cancelled() && (needs.terraform-fmt.result == 'skipped' || needs.terraform-fmt.outputs.diff_exists == 'false') }}
     runs-on: ${{ inputs.github_runner }}
     outputs:
       lint_status: ${{ steps.lint.outcome }}
@@ -599,11 +530,10 @@ jobs:
   terraform-test:
     needs:
       - terraform-fmt
-      - terraform-docs
       - terraform-lint
     # same guard as the jobs above: skip while a fmt or docs commit is in flight, because
     # the checkout would not include it
-    if: ${{ always() && !failure() && !cancelled() && inputs.enable_terraform_test && (needs.terraform-fmt.result == 'skipped' || needs.terraform-fmt.outputs.diff_exists == 'false') && (!inputs.enable_terraform_docs || needs.terraform-docs.result == 'skipped' || needs.terraform-docs.outputs.diff_exists == 'false') }}
+    if: ${{ always() && !failure() && !cancelled() && inputs.enable_terraform_test && (needs.terraform-fmt.result == 'skipped' || needs.terraform-fmt.outputs.diff_exists == 'false')  }}
     runs-on: ${{ inputs.github_runner }}
     outputs:
       test_status: ${{ steps.test.outcome }}
@@ -757,12 +687,11 @@ jobs:
   terraform-security:
     needs:
       - terraform-fmt
-      - terraform-docs
       - terraform-lint
-    # this job should only run if there are no new commits caused by terraform-fmt or terraform-docs
-    # if terraform-docs is disabled, it should only run if terraform-fmt caused no changes
+    # this job should only run if there are no new commits caused by terraform-fmt
+    # it should only run if terraform-fmt caused no changes
     # if terraform-fmt is disabled, it should run unconditionally
-    if: ${{ always() && !failure() && !cancelled() && (needs.terraform-fmt.result == 'skipped' || needs.terraform-fmt.outputs.diff_exists == 'false') && (!inputs.enable_terraform_docs || needs.terraform-docs.result == 'skipped' || needs.terraform-docs.outputs.diff_exists == 'false') }}
+    if: ${{ always() && !failure() && !cancelled() && (needs.terraform-fmt.result == 'skipped' || needs.terraform-fmt.outputs.diff_exists == 'false') }}
     runs-on: ${{ inputs.github_runner }}
     outputs:
       security_status: ${{ steps.security.outcome }}
@@ -1008,13 +937,12 @@ jobs:
   terraform-execution:
     needs:
       - terraform-fmt
-      - terraform-docs
       - terraform-lint
       - terraform-security
-    # this job should only run if there are no new commits caused by terraform-fmt or terraform-docs
-    # if terraform-docs is disabled, it should only run if terraform-fmt caused no changes
+    # this job should only run if there are no new commits caused by terraform-fmt
+    # it should only run if terraform-fmt caused no changes
     # also only run this job if terraform execution is enabled
-    if: ${{ always() && !failure() && !cancelled() && inputs.enable_terraform_execution && (needs.terraform-fmt.result == 'skipped' || needs.terraform-fmt.outputs.diff_exists == 'false') && (!inputs.enable_terraform_docs || needs.terraform-docs.result == 'skipped' || needs.terraform-docs.outputs.diff_exists == 'false') }}
+    if: ${{ always() && !failure() && !cancelled() && inputs.enable_terraform_execution && (needs.terraform-fmt.result == 'skipped' || needs.terraform-fmt.outputs.diff_exists == 'false') }}
     runs-on: ${{ inputs.github_runner }}
     outputs:
       execution_status: ${{ steps.plan.outcome || steps.apply.outcome }}
@@ -1199,7 +1127,6 @@ jobs:
   workflow-summary:
     needs:
       - terraform-fmt
-      - terraform-docs
       - terraform-lint
       - terraform-test
       - terraform-security
@@ -1212,7 +1139,6 @@ jobs:
         env:
           TERRAFORM_VERSION: ${{ inputs.terraform_version }}
           TF_FMT_RESULT: ${{ needs.terraform-fmt.result == 'skipped' && ':heavy_minus_sign:' || needs.terraform-fmt.outputs.fmt_status == 'success' && ':white_check_mark:' || ':x:' }}
-          TF_DOCS_RESULT: ${{ needs.terraform-docs.result == 'skipped' && ':heavy_minus_sign:' || needs.terraform-docs.outputs.docs_status == 'success' && ':white_check_mark:' || ':x:' }}
           TF_LINT_RESULT: ${{ needs.terraform-lint.result == 'skipped' && ':heavy_minus_sign:' || needs.terraform-lint.outputs.lint_status == 'success' && ':white_check_mark:' || ':x:' }}
           # a repository with no test files reports a dash rather than a tick, so the
           # summary does not imply tests passed when none exist
@@ -1226,7 +1152,6 @@ jobs:
           echo '| result | job |' >> $GITHUB_STEP_SUMMARY
           echo '|---|---|' >> $GITHUB_STEP_SUMMARY
           echo '| ${{ env.TF_FMT_RESULT }} | terraform format |' >> $GITHUB_STEP_SUMMARY
-          echo '| ${{ env.TF_DOCS_RESULT }} | terraform docs |' >> $GITHUB_STEP_SUMMARY
           echo '| ${{ env.TF_LINT_RESULT }} | terraform lint |' >> $GITHUB_STEP_SUMMARY
           echo '| ${{ env.TF_TEST_RESULT }} | terraform test |' >> $GITHUB_STEP_SUMMARY
           echo '| ${{ env.TF_SECURITY_RESULT }} | terraform security |' >> $GITHUB_STEP_SUMMARY
