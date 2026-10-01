@@ -23,16 +23,6 @@ on:
         default: true
         required: false
         type: boolean
-      enable_terraform_fmt:
-        description: 'Enable terraform fmt to format code'
-        default: true
-        required: false
-        type: boolean
-      enable_terraform_test:
-        description: 'Run "tofu test" when the repository contains .tftest.hcl files. A repository with no test files reports the job as skipped rather than failing, so this can stay on everywhere while tests are still being written.'
-        default: true
-        required: false
-        type: boolean
       enable_terraform_execution:
         description: 'Enable terraform plan on pull requests and apply on push to default branch'
         default: false
@@ -99,31 +89,6 @@ on:
         default: 'latest'
         required: false
         type: string
-      trivy_version:
-        description: 'Trivy version to use in github action'
-        default: 'v0.69.3'
-        required: false
-        type: string
-      trivy_fail_severity:
-        description: 'Comma-separated Trivy severities that fail the job. Matches what the previous reviewdog reporter treated as an error.'
-        default: 'HIGH,CRITICAL'
-        required: false
-        type: string
-      trivy_soft_fail:
-        description: 'Report Trivy findings without failing the job. The findings still appear in the annotations and the run summary. Set this for reusable modules, where Trivy flags a supported configuration (a public load balancer, a plain HTTP listener) that the caller rather than the module decides.'
-        default: false
-        required: false
-        type: boolean
-      commit_user:
-        description: 'Username which should be used for commits by github action'
-        default: 'github-actions'
-        required: false
-        type: string
-      commit_email:
-        description: 'Email which should be used for commits by github action'
-        default: 'noreply@github.com'
-        required: false
-        type: string
       concurrency_group:
         description: 'Name of concurrency group to manage concurrent github action runs'
         default: ${{ github.repository }}/${{ github.event.pull_request.head.ref || github.ref }}/${{ inputs.terraform_working_directory }}
@@ -139,31 +104,6 @@ on:
         default: 900 # 15 minutes
         required: false
         type: number
-      checkov_check:
-        description: 'Comma-separated list of Checkov tests to perform'
-        default: ''
-        required: false
-        type: string
-      checkov_skip_check:
-        description: 'Comma-separated list of Checkov tests to skip'
-        default: 'CKV_TF_1,CKV_TF_2'
-        required: false
-        type: string
-      checkov_soft_fail:
-        description: 'Report Checkov findings without failing the job. The findings still appear in the annotations and the run summary. Useful while an existing codebase is brought up to the policy set, so the scan is visible before it is enforced.'
-        default: false
-        required: false
-        type: boolean
-      checkov_enabled:
-        description: 'Enable or disable Checkov scan'
-        default: 'true'
-        required: false
-        type: string
-      checkov_log_level:
-        description: 'Log level for Checkov scan (CRITICAL, ERROR, WARNING, INFO, DEBUG)'
-        default: 'WARNING'
-        required: false
-        type: string
       enable_ecr_oci_modules:
         description: 'Enable ECR authentication for OCI modules. Set to true if using OCI modules from ECR'
         default: false
@@ -209,104 +149,8 @@ on:
 concurrency: ${{ inputs.concurrency_group }}
 
 jobs:
-  terraform-fmt:
-    if : ${{ inputs.enable_terraform_fmt }}
-    runs-on: ${{ inputs.github_runner }}
-    outputs:
-      fmt_status: ${{ steps.fmt.outcome }}
-      diff_exists: ${{ steps.fmt_commit.outputs.diff }}
-
-    env:
-      # the secrets context cannot be read from a step level if, so it is surfaced
-      # here as a plain value that a step condition can test
-      GH_APP_CONFIGURED: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_PRIVATE_KEY != '' }}
-    steps:
-      # Skipped rather than allowed to fail when no app is configured. continue-on-error
-      # stops the failure but not the error annotation, so every run of a repository that
-      # does not use private modules showed red errors on an otherwise green result, which
-      # teaches people to ignore annotations.
-      - name: Get Github Access Token
-        id: github_app_token
-        if: env.GH_APP_CONFIGURED == 'true'
-        continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
-        with:
-          client-id: ${{ secrets.GH_APP_ID }}
-          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ secrets.MODULE_REPOS }}
-
-      - name: Set Private Module Access Token
-        if: env.GH_APP_CONFIGURED == 'true'
-        run: |
-          git config --global url."https://x-access-token:${{ steps.github_app_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.pull_request.head.ref || github.ref }}
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # Ensure that the checkout action does not persist credentials to not override private module access
-          persist-credentials: false
-
-      - name: Setup Terraform
-        if: ${{ inputs.use_opentofu == false }}
-        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
-        with:
-          terraform_version: ${{ inputs.terraform_version }}
-          terraform_wrapper: false
-
-      - name: Setup OpenTofu
-        if: ${{ inputs.use_opentofu == true }}
-        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
-        with:
-          tofu_version: ${{ inputs.terraform_version }}
-          tofu_wrapper: false
-
-      - name: Terraform Format
-        id: fmt
-        run: |
-          if [[ "${{ inputs.use_opentofu }}" == "true" ]]; then
-            tofu fmt -recursive
-          else
-            terraform fmt -recursive
-          fi
-        working-directory: ${{ inputs.terraform_working_directory }}
-
-      - name: Commit files
-        id: fmt_commit
-        run: |
-          git config --local user.name "${{ inputs.commit_user }}"
-          git config --local user.email "${{ inputs.commit_email }}"
-          if [[ -z $(git status -s) ]]; then
-            echo "diff=false" >> $GITHUB_OUTPUT
-          else
-            echo "diff=true" >> $GITHUB_OUTPUT
-          fi
-          git diff-index --quiet HEAD || git commit -m "style(terraform fmt): format code" -a
-
-      # Plain git rather than a third-party action. This step pushes commits to the
-      # caller's repository, which makes it the most privileged external dependency in the
-      # pipeline, and it does no more than one push command.
-      - name: Push changes
-        if: steps.fmt_commit.outputs.diff == 'true'
-        env:
-          # the app token when one was minted, otherwise the job's own token
-          TOKEN: ${{ steps.github_app_token.outputs.token || secrets.GITHUB_TOKEN }}
-          # head.ref on a pull request, ref_name on a push; both are bare branch names
-          BRANCH: ${{ github.event.pull_request.head.ref || github.ref_name }}
-        run: |
-          set -euo pipefail
-          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            "HEAD:refs/heads/${BRANCH}"
-
   terraform-lint:
-    needs:
-      - terraform-fmt
-    # this job should only run if there are no new commits caused by terraform-fmt
-    # should only run if terraform-fmt caused no changes
-    # if terraform-fmt is disabled, it should run unconditionally
-    if: ${{ always() && !failure() && !cancelled() && (needs.terraform-fmt.result == 'skipped' || needs.terraform-fmt.outputs.diff_exists == 'false') }}
+    if: ${{ always() && !failure() && !cancelled() }}
     runs-on: ${{ inputs.github_runner }}
     outputs:
       lint_status: ${{ steps.lint.outcome }}
@@ -522,12 +366,8 @@ jobs:
 
   terraform-execution:
     needs:
-      - terraform-fmt
       - terraform-lint
-    # this job should only run if there are no new commits caused by terraform-fmt
-    # it should only run if terraform-fmt caused no changes
-    # also only run this job if terraform execution is enabled
-    if: ${{ always() && !failure() && !cancelled() && inputs.enable_terraform_execution && (needs.terraform-fmt.result == 'skipped' || needs.terraform-fmt.outputs.diff_exists == 'false') }}
+    if: ${{ always() && !failure() && !cancelled() && inputs.enable_terraform_execution  }}
     runs-on: ${{ inputs.github_runner }}
     outputs:
       execution_status: ${{ steps.plan.outcome || steps.apply.outcome }}
@@ -711,7 +551,6 @@ jobs:
 
   workflow-summary:
     needs:
-      - terraform-fmt
       - terraform-lint
       - terraform-execution
     runs-on: ${{ inputs.github_runner }}
@@ -721,7 +560,6 @@ jobs:
       - name: Workflow Summary
         env:
           TERRAFORM_VERSION: ${{ inputs.terraform_version }}
-          TF_FMT_RESULT: ${{ needs.terraform-fmt.result == 'skipped' && ':heavy_minus_sign:' || needs.terraform-fmt.outputs.fmt_status == 'success' && ':white_check_mark:' || ':x:' }}
           TF_LINT_RESULT: ${{ needs.terraform-lint.result == 'skipped' && ':heavy_minus_sign:' || needs.terraform-lint.outputs.lint_status == 'success' && ':white_check_mark:' || ':x:' }}
           # a repository with no test files reports a dash rather than a tick, so the
           # summary does not imply tests passed when none exist
@@ -732,7 +570,6 @@ jobs:
           echo '' >> $GITHUB_STEP_SUMMARY
           echo '| result | job |' >> $GITHUB_STEP_SUMMARY
           echo '|---|---|' >> $GITHUB_STEP_SUMMARY
-          echo '| ${{ env.TF_FMT_RESULT }} | terraform format |' >> $GITHUB_STEP_SUMMARY
           echo '| ${{ env.TF_LINT_RESULT }} | terraform lint |' >> $GITHUB_STEP_SUMMARY
           if [[ "${{ inputs.enable_terraform_execution }}" == "true" && "${{ env.TF_EXECUTION_TYPE }}" != "skip" ]]; then
             echo '| ${{ env.TF_EXECUTION_RESULT }} | terraform ${{ env.TF_EXECUTION_TYPE }} |' >> $GITHUB_STEP_SUMMARY
