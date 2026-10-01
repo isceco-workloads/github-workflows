@@ -1,0 +1,34 @@
+version: 2
+
+# External actions are pinned to a commit rather than a tag, because a tag can be moved to
+# point at different code under the same name. A pin without an update mechanism only trades
+# one problem for another, so Dependabot maintains them: it understands the
+# "@<sha> # <version>" form and updates both parts together.
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      # off Monday and off the hour, so these do not land with everyone else's
+      day: "tuesday"
+      time: "06:20"
+    open-pull-requests-limit: 5
+    commit-message:
+      # fix rather than chore, so a bump cuts a patch release.
+      #
+      # These workflows exist to be consumed by other repositories, which pin a released
+      # tag. A dependency update that lands on main without a release never reaches them:
+      # the pinned versions here would move while every consumer stayed on the last tag,
+      # which is the opposite of what pinning plus Dependabot is for.
+      prefix: "fix"
+    labels:
+      - "dependencies"
+    groups:
+      # One pull request for the routine bumps rather than five. Majors stay separate,
+      # because those are the ones that need reading before merging.
+      actions-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
