@@ -1,0 +1,382 @@
+name: Execute Terraform
+
+on:
+  workflow_call:
+    inputs:
+      aws_oidc_role_arn:
+        description: 'AWS OIDC role ARN to assume for terraform execution (requires "enable_terraform_execution" to be true)'
+        default: ''
+        required: false
+        type: string
+      aws_oidc_role_duration_seconds:
+        description: 'Duration in seconds for assuming the AWS OIDC role (requires "enable"_terraform_execution" to be true)'
+        default: 900 # 15 minutes
+        required: false
+        type: number
+      aws_default_region:
+        description: 'Default AWS region to use for terraform execution (requires "enable_terraform_execution" to be true)'
+        default: 'eu-central-2'
+        required: false
+        type: string
+      enable_ecr_oci_modules:
+        description: 'Enable ECR authentication for OCI modules. Set to true if using OCI modules from ECR'
+        default: false
+        required: false
+        type: boolean
+      ecr_oci_registry_ids:
+        description: 'Comma-separated list of ECR registry IDs to authenticate with (e.g., "031244176730,123456789012")'
+        default: ''
+        required: false
+        type: string
+      aws_oidc_role_from_secret:
+        description: 'Set true when the role ARN is supplied through the AWS_OIDC_ROLE_ARN secret instead of the aws_oidc_role_arn input. A secret cannot be tested in a step condition, so without this the AWS steps have no way to know a role was given and skip themselves.'
+        default: false
+        required: false
+        type: boolean
+      github_runner:
+        description: 'Name of GitHub-hosted runner or self-hosted runner'
+        # CodeBuild hosted ephemeral runner in pc-core-platform-tooling, rather than a GitHub
+        # hosted one. Self hosted runners are not metered, so this keeps CI running when the
+        # organisation's GitHub Actions minutes are exhausted, which is what prompted it.
+        #
+        # The run id and attempt are what make each runner ephemeral: CodeBuild matches the label
+        # and starts one container for that job alone. A label without them is never dispatched.
+        # Expressions work here because a workflow_call default is evaluated in the caller's
+        # context, the same way concurrency_group below already relies on.
+        #
+        # Override this to 'ubuntu-latest' to go back to a GitHub hosted runner for one caller.
+        default: 'ubuntu-latest'
+        required: false
+        type: string
+      terraform_version:
+        description: 'Terraform version used in github action'
+        required: true
+        type: string
+      terraform_working_directory:
+        description: 'A relative path starting with "." that Terraform will execute within (e.g. "./infrastructure")'
+        default: '.'
+        required: false
+        type: string
+      use_opentofu:
+        description: 'Use OpenTofu instead of Terraform'
+        default: true
+        required: false
+        type: boolean
+      default_branch:
+        description: 'Default branch name for terraform apply (e.g. main, master)'
+        default: 'main'
+        required: false
+        type: string
+    secrets:
+      # GitHub App credentials to use instead of default GITHUB_TOKEN to avoid not triggering workflow runs on commit
+      GH_APP_ID:
+        required: false
+      GH_APP_PRIVATE_KEY:
+        required: false
+      # (optional) Role ARN to assume via OIDC, as an alternative to the 'aws_oidc_role_arn' input.
+      #
+      # Both exist because a caller cannot always use the input. The contexts allowed in
+      # 'jobs.<job_id>.with.<with_id>' are github, needs, strategy, matrix, inputs and vars, so a
+      # caller holding the ARN in an organisation secret has no way to pass it there and must send
+      # it here instead. A caller holding it in an organisation variable can keep using the input.
+      #
+      # Where both are supplied the secret wins, on the grounds that the more specific of the two
+      # is the one the caller went out of its way to provide.
+      #
+      # A caller using this secret must also set 'aws_oidc_role_from_secret', because the steps
+      # that consume it cannot detect it on their own. 
+      AWS_OIDC_ROLE_ARN:
+        required: false
+jobs:
+  Execute:
+    runs-on: ${{ inputs.github_runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # the secrets context cannot be read from a step level if, so it is surfaced
+      # here as a plain value that a step condition can test
+      GH_APP_CONFIGURED: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_PRIVATE_KEY != '' }}
+
+    steps:
+    - name: Get Github Access Token
+      id: github_app_token
+      if: env.GH_APP_CONFIGURED == 'true'
+      continue-on-error: true
+      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+      with:
+        client-id: ${{ secrets.GH_APP_ID }}
+        private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+        owner: ${{ github.repository_owner }}
+
+    - name: Set Private Module Access Token
+      if: env.GH_APP_CONFIGURED == 'true'
+      run: |
+        git config --global url."https://x-access-token:${{ steps.github_app_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      with:
+        ref: ${{ github.event.pull_request.head.ref || github.ref }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        # Ensure that the checkout action does not persist credentials to not override private module access
+        persist-credentials: false
+  
+    - name: Setup Terraform
+      if: ${{ inputs.use_opentofu == false }}
+      uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+      with:
+        terraform_version: ${{ inputs.terraform_version }}
+        terraform_wrapper: false
+
+    - name: Setup OpenTofu
+      if: ${{ inputs.use_opentofu == true }}
+      uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
+      with:
+        tofu_version: ${{ inputs.terraform_version }}
+        tofu_wrapper: false
+
+    - name: Determine Execution Type
+      id: set_execution_type
+      run: |
+        if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          echo "type=plan" >> $GITHUB_OUTPUT
+          echo "::notice::Will run Terraform Plan for pull request"
+        elif [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/${{ inputs.default_branch }}" ]]; then
+          echo "type=apply" >> $GITHUB_OUTPUT
+          echo "::notice::Will run Terraform Apply for push to ${{ inputs.default_branch }}"
+        else
+          echo "type=skip" >> $GITHUB_OUTPUT
+          echo "::notice::Skipping Terraform execution - not a PR or push to ${{ inputs.default_branch }}"
+        fi
+
+    - name: "Configure AWS credentials"
+      if: ${{ inputs.aws_oidc_role_arn != '' || inputs.aws_oidc_role_from_secret }}
+      uses: isceco/github-workflows/.github/actions/aws/configure_credentials@v1
+      with:
+        AWS_ROLE_ARN_TO_ASSUME: ${{ secrets.AWS_OIDC_ROLE_ARN || inputs.aws_oidc_role_arn }}
+        AWS_REGION: ${{ inputs.aws_default_region }}
+        AWS_SESSION_NAME: GitHubActions-${{ github.run_id }}
+        AWS_SESSION_DURATION: ${{ inputs.aws_oidc_role_duration_seconds }}
+
+    - name: Setup ECR Authentication for OCI Modules EXEC
+      if: ${{ inputs.enable_ecr_oci_modules && inputs.ecr_oci_registry_ids != '' }}
+      env:
+        ECR_REGISTRY_IDS: ${{ inputs.ecr_oci_registry_ids }}
+        AWS_DEFAULT_REGION_INPUT: ${{ inputs.aws_default_region }}
+      run: |
+        set -euo pipefail
+        mkdir -p ~/.docker
+        AUTHS='{}'
+        IFS=',' read -ra REGISTRY_IDS <<< "${ECR_REGISTRY_IDS}"
+        for registry_id in "${REGISTRY_IDS[@]}"; do
+          registry_id="$(echo "${registry_id}" | xargs)"
+          [ -n "${registry_id}" ] || continue
+          ECR_TOKEN="$(aws ecr get-login-password --region "${AWS_DEFAULT_REGION_INPUT}")"
+          ECR_REGISTRY="${registry_id}.dkr.ecr.${AWS_DEFAULT_REGION_INPUT}.amazonaws.com"
+          AUTH="$(printf 'AWS:%s' "${ECR_TOKEN}" | base64 -w 0)"
+          AUTHS="$(jq -c --arg reg "${ECR_REGISTRY}" --arg auth "${AUTH}" \
+            '.[$reg] = {auth: $auth}' <<< "${AUTHS}")"
+        done
+        jq -n --argjson auths "${AUTHS}" '{auths: $auths}' > ~/.docker/config.json
+
+    - name: Terraform Init
+      if: ${{ steps.set_execution_type.outputs.type != 'skip' }}
+      id: init
+      run: |
+        if [[ "${{ inputs.use_opentofu }}" == "true" ]]; then
+          tofu init
+        else
+          terraform init
+        fi
+      working-directory: ${{ inputs.terraform_working_directory }}
+
+    - name: Terraform fmt
+      if: ${{ steps.set_execution_type.outputs.type == 'plan' }}
+      id: fmt
+      run: |
+        if [[ "${{ inputs.use_opentofu }}" == "true" ]]; then
+          tofu fmt -check
+        else
+          terraform fmt -check
+        fi
+      working-directory: ${{ inputs.terraform_working_directory }}
+      continue-on-error: true
+
+    - name: Terraform Validate
+      if: ${{ steps.set_execution_type.outputs.type == 'plan' }}
+      id: validate
+      run: |
+        if [[ "${{ inputs.use_opentofu }}" == "true" ]]; then
+          tofu validate -no-color
+        else
+          terraform validate -no-color
+        fi
+      working-directory: ${{ inputs.terraform_working_directory }}
+
+    - name: Terraform plan
+      if: ${{ steps.set_execution_type.outputs.type == 'plan' }}
+      id: plan
+      working-directory: ${{ inputs.terraform_working_directory }}
+      run: |
+        if [[ "${{ inputs.use_opentofu }}" == "true" ]]; then
+          PLAN_OUTPUT=$(tofu plan -no-color -input=false 2>&1) || true
+        else
+          PLAN_OUTPUT=$(terraform plan -no-color -input=false 2>&1) || true
+        fi
+        PLAN_FILTERED=$(echo "$PLAN_OUTPUT" \
+          | grep -vE 'Refreshing state\.\.\.|: Reading\.\.\.|: Read complete after' \
+          | sed '/^$/N;/^\n$/d' \
+          | sed 's/^  - /- /' \
+          | sed 's/^  + /+ /' \
+          | sed 's/^  ~ /! /' \
+          | sed 's/^      - /  - /' \
+          | sed 's/^      + /  + /' \
+          | sed 's/^      ~ /  ! /')
+        echo "stdout<<EOF" >> $GITHUB_OUTPUT
+        echo "$PLAN_FILTERED" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+      continue-on-error: true
+
+    - name: Terraform Apply
+      if: ${{ steps.set_execution_type.outputs.type == 'apply' }}
+      id: apply
+      working-directory: ${{ inputs.terraform_working_directory }}
+      run: |
+        if [[ "${{ inputs.use_opentofu }}" == "true" ]]; then
+          APPLY_OUTPUT=$(tofu apply -auto-approve -no-color -input=false 2>&1) || true
+        else
+          APPLY_OUTPUT=$(terraform apply -auto-approve -no-color -input=false 2>&1) || true
+        fi
+        APPLY_FILTERED=$(echo "$APPLY_OUTPUT" \
+          | grep -vE 'Refreshing state\.\.\.|: Reading\.\.\.|: Read complete after' \
+          | sed '/^$/N;/^\n$/d' \
+          | sed 's/^  - /- /' \
+          | sed 's/^  + /+ /' \
+          | sed 's/^  ~ /! /' \
+          | sed 's/^      - /  - /' \
+          | sed 's/^      + /  + /' \
+          | sed 's/^      ~ /  ! /')
+        echo "stdout<<EOF" >> $GITHUB_OUTPUT
+        echo "$APPLY_FILTERED" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+      continue-on-error: true
+
+    # - name: Publish Terraform Plan Artifact
+    #   uses: actions/upload-artifact@v3
+    #   with:
+    #     name: terraform-plan-${{ inputs.environment }}
+    #     path: ${{ inputs.tf_build_path }}/tfplan
+    - name: Write PR summary
+      uses: actions/github-script@v7
+      if: ${{ steps.set_execution_type.outputs.type == 'plan' }}
+      env:
+        PLAN: ${{ steps.plan.outputs.stdout }}
+        WORKING_DIR: ${{ inputs.terraform_working_directory }}
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          const marker = '<!-- tf-plan-bot -->';
+          const section = `### 📁 \`${process.env.WORKING_DIR}\`
+
+          | Check | Result |
+          |---|---|
+          | 🖌 Format | \`${{ steps.fmt.outcome }}\` |
+          | ⚙️ Init | \`${{ steps.init.outcome }}\` |
+          | 🤖 Validate | \`${{ steps.validate.outcome }}\` |
+          | 📖 Plan | \`${{ steps.plan.outcome }}\` |
+
+          <details><summary>Show Plan</summary>
+
+          \`\`\`diff
+          ${process.env.PLAN}
+          \`\`\`
+
+          </details>
+          <!-- tf-plan-section:${process.env.WORKING_DIR} -->`;
+
+          const { data: comments } = await github.rest.issues.listComments({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+          });
+          const existing = comments.find(c => c.body.includes(marker));
+
+          let body;
+          if (existing) {
+            const sectionMarker = `<!-- tf-plan-section:${process.env.WORKING_DIR} -->`;
+            if (existing.body.includes(sectionMarker)) {
+              // replace existing section for this working directory
+              const re = new RegExp(`### 📁 \\\`${process.env.WORKING_DIR.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\\`[\\s\\S]*?${sectionMarker}`);
+              body = existing.body.replace(re, section.trim());
+            } else {
+              // append new section
+              body = existing.body + '\n\n---\n' + section.trim();
+            }
+            await github.rest.issues.updateComment({
+              comment_id: existing.id,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+          } else {
+            body = `${marker}\n## OpenTofu Plan Results\n*Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*\n` + section.trim();
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+          }
+
+    - name: Write Plan summary
+      if: ${{ steps.set_execution_type.outputs.type == 'plan' }}
+      env:
+        PLAN: ${{ steps.plan.outputs.stdout }}
+      run: |
+        cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+        ### 📁 `${{ inputs.terraform_working_directory }}`
+
+        | Check | Result |
+        |---|---|
+        | 🖌 Format | `${{ steps.fmt.outcome }}` |
+        | ⚙️ Init | `${{ steps.init.outcome }}` |
+        | 🤖 Validate | `${{ steps.validate.outcome }}` |
+        | 📖 Plan | `${{ steps.plan.outcome }}` |
+
+        <details><summary>Show Plan</summary>
+
+        ```diff
+        EOF
+        echo "$PLAN" >> $GITHUB_STEP_SUMMARY
+        cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+        ```
+
+        </details>
+        EOF
+
+    - name: Write Apply summary
+      if: ${{ steps.set_execution_type.outputs.type == 'apply' }}
+      env:
+        APPLY: ${{ steps.apply.outputs.stdout }}
+      run: |
+        cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+        ### 📁 `${{ inputs.terraform_working_directory }}`
+
+        | Check | Result |
+        |---|---|
+        | 🖌 Format | `${{ steps.fmt.outcome }}` |
+        | ⚙️ Init | `${{ steps.init.outcome }}` |
+        | 🤖 Validate | `${{ steps.validate.outcome }}` |
+        | 📖 Apply | `${{ steps.apply.outcome }}` |
+
+        <details><summary>Show Apply</summary>
+
+        ```diff
+        EOF
+        echo "$APPLY" >> $GITHUB_STEP_SUMMARY
+        cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+        ```
+
+        </details>
+        EOF
