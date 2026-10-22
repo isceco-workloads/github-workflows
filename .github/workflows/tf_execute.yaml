@@ -218,13 +218,15 @@ jobs:
       if: ${{ steps.set_execution_type.outputs.type == 'plan' }}
       id: plan
       working-directory: ${{ inputs.terraform_working_directory }}
+      env:
+        PLAN_OUTPUT_FILE: ${{ runner.temp }}/tf_plan_output.txt
       run: |
         if [[ "${{ inputs.use_opentofu }}" == "true" ]]; then
           PLAN_OUTPUT=$(tofu plan -no-color -input=false 2>&1) || true
         else
           PLAN_OUTPUT=$(terraform plan -no-color -input=false 2>&1) || true
         fi
-        PLAN_FILTERED=$(echo "$PLAN_OUTPUT" \
+        echo "$PLAN_OUTPUT" \
           | grep -vE 'Refreshing state\.\.\.|: Reading\.\.\.|: Read complete after' \
           | sed '/^$/N;/^\n$/d' \
           | sed 's/^  - /- /' \
@@ -232,23 +234,23 @@ jobs:
           | sed 's/^  ~ /! /' \
           | sed 's/^      - /  - /' \
           | sed 's/^      + /  + /' \
-          | sed 's/^      ~ /  ! /')
-        echo "stdout<<EOF" >> $GITHUB_OUTPUT
-        echo "$PLAN_FILTERED" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+          | sed 's/^      ~ /  ! /' \
+          > "$PLAN_OUTPUT_FILE"
       continue-on-error: true
 
     - name: Terraform Apply
       if: ${{ steps.set_execution_type.outputs.type == 'apply' }}
       id: apply
       working-directory: ${{ inputs.terraform_working_directory }}
+      env:
+        APPLY_OUTPUT_FILE: ${{ runner.temp }}/tf_apply_output.txt
       run: |
         if [[ "${{ inputs.use_opentofu }}" == "true" ]]; then
           APPLY_OUTPUT=$(tofu apply -auto-approve -no-color -input=false 2>&1) || true
         else
           APPLY_OUTPUT=$(terraform apply -auto-approve -no-color -input=false 2>&1) || true
         fi
-        APPLY_FILTERED=$(echo "$APPLY_OUTPUT" \
+        echo "$APPLY_OUTPUT" \
           | grep -vE 'Refreshing state\.\.\.|: Reading\.\.\.|: Read complete after' \
           | sed '/^$/N;/^\n$/d' \
           | sed 's/^  - /- /' \
@@ -256,10 +258,8 @@ jobs:
           | sed 's/^  ~ /! /' \
           | sed 's/^      - /  - /' \
           | sed 's/^      + /  + /' \
-          | sed 's/^      ~ /  ! /')
-        echo "stdout<<EOF" >> $GITHUB_OUTPUT
-        echo "$APPLY_FILTERED" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+          | sed 's/^      ~ /  ! /' \
+          > "$APPLY_OUTPUT_FILE"
       continue-on-error: true
 
     # - name: Publish Terraform Plan Artifact
@@ -271,11 +271,33 @@ jobs:
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
       if: ${{ steps.set_execution_type.outputs.type == 'plan' }}
       env:
-        PLAN: ${{ steps.plan.outputs.stdout }}
+        PLAN_OUTPUT_FILE: ${{ runner.temp }}/tf_plan_output.txt
         WORKING_DIR: ${{ inputs.terraform_working_directory }}
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
+          const fs = require('fs');
+          const planFile = process.env.PLAN_OUTPUT_FILE;
+          let plan = fs.existsSync(planFile) ? fs.readFileSync(planFile, 'utf8') : '';
+          // Trailing newline from the file would only add a blank line inside the
+          // diff fence; trim it so the rendered comment matches the old `echo "$PLAN"`.
+          plan = plan.replace(/\n$/, '');
+
+          // A single PR/issue comment body is limited to 65536 chars. Cap the plan
+          // output below that (leaving headroom for the marker, table, fences and
+          // the notice) and keep the TAIL so the `Plan: X to add ...` line at the
+          // end survives. For normal-size output this is a no-op and the rendered
+          // comment is byte-identical to before.
+          const COMMENT_CAP = 60000;
+          let planTruncated = false;
+          if (plan.length > COMMENT_CAP) {
+            plan = plan.slice(-COMMENT_CAP);
+            planTruncated = true;
+          }
+          const truncationNotice = planTruncated
+            ? '\n> ⚠️ Output truncated to last 60,000 chars. See job logs for full output.'
+            : '';
+
           const marker = '<!-- tf-plan-bot -->';
           const section = `### 📁 \`${process.env.WORKING_DIR}\`
 
@@ -289,9 +311,9 @@ jobs:
           <details><summary>Show Plan</summary>
 
           \`\`\`diff
-          ${process.env.PLAN}
+          ${plan}
           \`\`\`
-
+          ${truncationNotice}
           </details>
           <!-- tf-plan-section:${process.env.WORKING_DIR} -->`;
 
@@ -332,7 +354,8 @@ jobs:
     - name: Write Plan summary
       if: ${{ steps.set_execution_type.outputs.type == 'plan' }}
       env:
-        PLAN: ${{ steps.plan.outputs.stdout }}
+        PLAN_OUTPUT_FILE: ${{ runner.temp }}/tf_plan_output.txt
+        SUMMARY_CAP_BYTES: "102400"
       run: |
         cat >> $GITHUB_STEP_SUMMARY << 'EOF'
         ### 📁 `${{ inputs.terraform_working_directory }}`
@@ -348,17 +371,33 @@ jobs:
 
         ```diff
         EOF
-        echo "$PLAN" >> $GITHUB_STEP_SUMMARY
+        if [ -f "$PLAN_OUTPUT_FILE" ]; then
+          TOTAL=$(wc -c < "$PLAN_OUTPUT_FILE")
+          CAP="$SUMMARY_CAP_BYTES"
+          HALF=$((CAP / 2))
+          if [ "$TOTAL" -gt "$CAP" ]; then
+            head -c "$HALF" "$PLAN_OUTPUT_FILE" >> $GITHUB_STEP_SUMMARY
+            printf '\n... [middle elided — see job logs for full output] ...\n' >> $GITHUB_STEP_SUMMARY
+            tail -c "$HALF" "$PLAN_OUTPUT_FILE" >> $GITHUB_STEP_SUMMARY
+          else
+            cat "$PLAN_OUTPUT_FILE" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
         cat >> $GITHUB_STEP_SUMMARY << 'EOF'
         ```
 
         </details>
         EOF
+        if [ -f "$PLAN_OUTPUT_FILE" ] && [ "${TOTAL:-0}" -gt "$SUMMARY_CAP_BYTES" ]; then
+          echo "> ⚠️ Output truncated: showing first/last $((SUMMARY_CAP_BYTES / 2)) of $TOTAL bytes. See job logs for full output." >> $GITHUB_STEP_SUMMARY
+        fi
+
 
     - name: Write Apply summary
       if: ${{ steps.set_execution_type.outputs.type == 'apply' }}
       env:
-        APPLY: ${{ steps.apply.outputs.stdout }}
+        APPLY_OUTPUT_FILE: ${{ runner.temp }}/tf_apply_output.txt
+        SUMMARY_CAP_BYTES: "102400"
       run: |
         cat >> $GITHUB_STEP_SUMMARY << 'EOF'
         ### 📁 `${{ inputs.terraform_working_directory }}`
@@ -374,9 +413,15 @@ jobs:
 
         ```diff
         EOF
-        echo "$APPLY" >> $GITHUB_STEP_SUMMARY
+        if [ -f "$APPLY_OUTPUT_FILE" ]; then
+          TOTAL=$(wc -c < "$APPLY_OUTPUT_FILE")
+          tail -c "$SUMMARY_CAP_BYTES" "$APPLY_OUTPUT_FILE" >> $GITHUB_STEP_SUMMARY
+        fi
         cat >> $GITHUB_STEP_SUMMARY << 'EOF'
         ```
 
         </details>
         EOF
+        if [ -f "$APPLY_OUTPUT_FILE" ] && [ "${TOTAL:-0}" -gt "$SUMMARY_CAP_BYTES" ]; then
+          echo "> ⚠️ Output truncated: showing last $SUMMARY_CAP_BYTES of $TOTAL bytes. See job logs for full output." >> $GITHUB_STEP_SUMMARY
+        fi
