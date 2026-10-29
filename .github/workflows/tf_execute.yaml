@@ -283,39 +283,42 @@ jobs:
           // diff fence; trim it so the rendered comment matches the old `echo "$PLAN"`.
           plan = plan.replace(/\n$/, '');
 
-          // A single PR/issue comment body is limited to 65536 chars. Cap the plan
-          // output below that (leaving headroom for the marker, table, fences and
-          // the notice) and keep the TAIL so the `Plan: X to add ...` line at the
-          // end survives. For normal-size output this is a no-op and the rendered
-          // comment is byte-identical to before.
-          const COMMENT_CAP = 60000;
-          let planTruncated = false;
-          if (plan.length > COMMENT_CAP) {
-            plan = plan.slice(-COMMENT_CAP);
-            planTruncated = true;
-          }
-          const truncationNotice = planTruncated
-            ? '\n> ⚠️ Output truncated to last 60,000 chars. See job logs for full output.'
-            : '';
-
           const marker = '<!-- tf-plan-bot -->';
-          const section = `### 📁 \`${process.env.WORKING_DIR}\`
+          const sectionMarker = `<!-- tf-plan-section:${process.env.WORKING_DIR} -->`;
 
-          | Check | Result |
-          |---|---|
-          | 🖌 Format | \`${{ steps.fmt.outcome }}\` |
-          | ⚙️ Init | \`${{ steps.init.outcome }}\` |
-          | 🤖 Validate | \`${{ steps.validate.outcome }}\` |
-          | 📖 Plan | \`${{ steps.plan.outcome }}\` |
-
-          <details><summary>Show Plan</summary>
-
-          \`\`\`diff
-          ${plan}
-          \`\`\`
-          ${truncationNotice}
-          </details>
-          <!-- tf-plan-section:${process.env.WORKING_DIR} -->`;
+          // Build the section for this working directory.
+          //
+          // The scaffolding (header, table, <details>, fences) is assembled from an
+          // array joined with '\n' so every line is guaranteed flush-left. This is
+          // essential: Markdown treats 4+ leading spaces as an indented code block, so
+          // any YAML indentation leaking into these lines breaks the collapsible
+          // <details> rendering (which is exactly what happened before). We must NOT
+          // dedent the whole string with a regex either, because the plan body itself
+          // legitimately contains deeply indented lines that a regex would mangle.
+          //
+          // `planBody` is injected verbatim as its own line(s) so it can be truncated
+          // independently below without disturbing the surrounding scaffolding.
+          const buildSection = (planBody, notice) => {
+            const lines = [
+              `### 📁 \`${process.env.WORKING_DIR}\``,
+              '',
+              '| Check | Result |',
+              '|---|---|',
+              `| 🖌 Format | \`${{ steps.fmt.outcome }}\` |`,
+              `| ⚙️ Init | \`${{ steps.init.outcome }}\` |`,
+              `| 🤖 Validate | \`${{ steps.validate.outcome }}\` |`,
+              `| 📖 Plan | \`${{ steps.plan.outcome }}\` |`,
+              '',
+              '<details><summary>Show Plan</summary>',
+              '',
+              '```diff',
+              planBody,
+              '```',
+            ];
+            if (notice) lines.push(notice);
+            lines.push('</details>', sectionMarker);
+            return lines.join('\n');
+          };
 
           const { data: comments } = await github.rest.issues.listComments({
             issue_number: context.issue.number,
@@ -324,33 +327,43 @@ jobs:
           });
           const existing = comments.find(c => c.body.includes(marker));
 
-          let body;
-          if (existing) {
-            const sectionMarker = `<!-- tf-plan-section:${process.env.WORKING_DIR} -->`;
-            if (existing.body.includes(sectionMarker)) {
-              // replace existing section for this working directory
-              const re = new RegExp(`### 📁 \\\`${process.env.WORKING_DIR.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\\`[\\s\\S]*?${sectionMarker}`);
-              body = existing.body.replace(re, section.trim());
-            } else {
-              // append new section
-              body = existing.body + '\n\n---\n' + section.trim();
-            }
-          } else {
-            body = `${marker}\n## OpenTofu Plan Results\n*Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*\n` + section.trim();
-          }
-
           // A single PR/issue comment body is hard-limited to 65536 chars by the
-          // GitHub API. With a matrix build every job appends its own section to the
-          // SAME comment, so even per-plan truncation above is not enough: two large
-          // sections together still blow past the limit and the API rejects the whole
-          // comment with "body is too long" (HTTP 422). Enforce the ceiling on the
-          // final body here, right before the API call, keeping the TAIL so the most
-          // recent section and its `Plan:` summary line survive.
+          // GitHub API, and with a matrix build every job appends its own section to
+          // the SAME comment. Rather than truncate the finished body (which would cut
+          // through a <details>/fenced block and break the collapsible rendering), we
+          // truncate only THIS section's plan text until the whole assembled body fits
+          // under the limit. That keeps every section's Markdown scaffolding intact.
           const BODY_LIMIT = 65536;
+          const SAFETY = 1024; // headroom below the hard cap
+
+          // Assemble the body given a candidate section, without mutating state.
+          const assemble = (section) => {
+            if (existing) {
+              if (existing.body.includes(sectionMarker)) {
+                // replace existing section for this working directory
+                const re = new RegExp(`### 📁 \\\`${process.env.WORKING_DIR.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\\`[\\s\\S]*?${sectionMarker}`);
+                return existing.body.replace(re, section.trim());
+              }
+              // append new section
+              return existing.body + '\n\n---\n' + section.trim();
+            }
+            return `${marker}\n## OpenTofu Plan Results\n*Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*\n` + section.trim();
+          };
+
+          const truncNotice = '> ⚠️ Plan output truncated to fit GitHub\'s comment size limit. See the job summary and logs for the full output.';
+
+          // First attempt with the full plan.
+          let body = assemble(buildSection(plan, ''));
+
           if (body.length > BODY_LIMIT) {
-            const overflowNotice =
-              '\n\n> ⚠️ This comment exceeded GitHub\'s 65,536 character limit and was truncated. See the job summaries and logs for the full plan output.';
-            body = overflowNotice + body.slice(-(BODY_LIMIT - overflowNotice.length));
+            // How many chars the rest of the body (everything except this plan text)
+            // occupies, so we can size the plan to what remains.
+            const overhead = assemble(buildSection('', truncNotice)).length;
+            let budget = BODY_LIMIT - SAFETY - overhead;
+            if (budget < 0) budget = 0;
+            // Keep the TAIL of the plan so the `Plan: X to add ...` summary survives.
+            const truncatedPlan = plan.slice(-budget);
+            body = assemble(buildSection(truncatedPlan, truncNotice));
           }
 
           if (existing) {
