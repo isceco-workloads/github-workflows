@@ -283,23 +283,33 @@ jobs:
           // diff fence; trim it so the rendered comment matches the old `echo "$PLAN"`.
           plan = plan.replace(/\n$/, '');
 
-          const marker = '<!-- tf-plan-bot -->';
-          const sectionMarker = `<!-- tf-plan-section:${process.env.WORKING_DIR} -->`;
+          // ONE COMMENT PER WORKING DIRECTORY.
+          //
+          // Earlier versions kept every matrix job's plan in a single shared comment.
+          // That cannot work: a PR/issue comment body is hard-limited to 65536 chars,
+          // and once two or three directories each contribute a large plan the SHARED
+          // body exceeds the limit no matter how much any single job truncates its own
+          // section (it cannot shrink the other jobs' sections). The GitHub API then
+          // rejects the whole comment with HTTP 422 "body is too long".
+          //
+          // Giving each directory its own comment means every comment holds exactly one
+          // plan, so the per-plan truncation below always keeps it under the limit, and
+          // concurrent matrix jobs never contend over the same comment body.
+          const marker = `<!-- tf-plan-bot:${process.env.WORKING_DIR} -->`;
 
-          // Build the section for this working directory.
-          //
-          // The scaffolding (header, table, <details>, fences) is assembled from an
-          // array joined with '\n' so every line is guaranteed flush-left. This is
-          // essential: Markdown treats 4+ leading spaces as an indented code block, so
-          // any YAML indentation leaking into these lines breaks the collapsible
-          // <details> rendering (which is exactly what happened before). We must NOT
-          // dedent the whole string with a regex either, because the plan body itself
-          // legitimately contains deeply indented lines that a regex would mangle.
-          //
-          // `planBody` is injected verbatim as its own line(s) so it can be truncated
-          // independently below without disturbing the surrounding scaffolding.
-          const buildSection = (planBody, notice) => {
+          // Build the comment body. The scaffolding (header, table, <details>, fences)
+          // is assembled from an array joined with '\n' so every line is guaranteed
+          // flush-left. This is essential: Markdown treats 4+ leading spaces as an
+          // indented code block, so any YAML indentation leaking into these lines
+          // breaks the collapsible <details> rendering. The plan body is injected
+          // verbatim as its own line(s) so it can be truncated independently below
+          // without disturbing the surrounding scaffolding (a regex dedent would mangle
+          // the plan's own legitimately-indented lines).
+          const buildBody = (planBody, notice) => {
             const lines = [
+              marker,
+              '## OpenTofu Plan Results',
+              `*Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`,
               `### 📁 \`${process.env.WORKING_DIR}\``,
               '',
               '| Check | Result |',
@@ -316,55 +326,32 @@ jobs:
               '```',
             ];
             if (notice) lines.push(notice);
-            lines.push('</details>', sectionMarker);
+            lines.push('</details>');
             return lines.join('\n');
           };
 
+          const BODY_LIMIT = 65536;
+          const SAFETY = 1024; // headroom below the hard cap
+          const truncNotice = '> ⚠️ Plan output truncated to fit GitHub\'s comment size limit. See the job summary and logs for the full output.';
+
+          // First attempt with the full plan; truncate only if it overflows.
+          let body = buildBody(plan, '');
+          if (body.length > BODY_LIMIT) {
+            const overhead = buildBody('', truncNotice).length;
+            let budget = BODY_LIMIT - SAFETY - overhead;
+            if (budget < 0) budget = 0;
+            // Keep the TAIL so the `Plan: X to add ...` summary line survives.
+            body = buildBody(plan.slice(-budget), truncNotice);
+          }
+
+          // Find this directory's own comment (if a previous run created one) and
+          // update it in place; otherwise create a fresh one.
           const { data: comments } = await github.rest.issues.listComments({
             issue_number: context.issue.number,
             owner: context.repo.owner,
             repo: context.repo.repo,
           });
           const existing = comments.find(c => c.body.includes(marker));
-
-          // A single PR/issue comment body is hard-limited to 65536 chars by the
-          // GitHub API, and with a matrix build every job appends its own section to
-          // the SAME comment. Rather than truncate the finished body (which would cut
-          // through a <details>/fenced block and break the collapsible rendering), we
-          // truncate only THIS section's plan text until the whole assembled body fits
-          // under the limit. That keeps every section's Markdown scaffolding intact.
-          const BODY_LIMIT = 65536;
-          const SAFETY = 1024; // headroom below the hard cap
-
-          // Assemble the body given a candidate section, without mutating state.
-          const assemble = (section) => {
-            if (existing) {
-              if (existing.body.includes(sectionMarker)) {
-                // replace existing section for this working directory
-                const re = new RegExp(`### 📁 \\\`${process.env.WORKING_DIR.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\\`[\\s\\S]*?${sectionMarker}`);
-                return existing.body.replace(re, section.trim());
-              }
-              // append new section
-              return existing.body + '\n\n---\n' + section.trim();
-            }
-            return `${marker}\n## OpenTofu Plan Results\n*Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*\n` + section.trim();
-          };
-
-          const truncNotice = '> ⚠️ Plan output truncated to fit GitHub\'s comment size limit. See the job summary and logs for the full output.';
-
-          // First attempt with the full plan.
-          let body = assemble(buildSection(plan, ''));
-
-          if (body.length > BODY_LIMIT) {
-            // How many chars the rest of the body (everything except this plan text)
-            // occupies, so we can size the plan to what remains.
-            const overhead = assemble(buildSection('', truncNotice)).length;
-            let budget = BODY_LIMIT - SAFETY - overhead;
-            if (budget < 0) budget = 0;
-            // Keep the TAIL of the plan so the `Plan: X to add ...` summary survives.
-            const truncatedPlan = plan.slice(-budget);
-            body = assemble(buildSection(truncatedPlan, truncNotice));
-          }
 
           if (existing) {
             await github.rest.issues.updateComment({
