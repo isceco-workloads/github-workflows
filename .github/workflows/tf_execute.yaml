@@ -279,32 +279,17 @@ jobs:
           const fs = require('fs');
           const planFile = process.env.PLAN_OUTPUT_FILE;
           let plan = fs.existsSync(planFile) ? fs.readFileSync(planFile, 'utf8') : '';
-          // Trailing newline from the file would only add a blank line inside the
-          // diff fence; trim it so the rendered comment matches the old `echo "$PLAN"`.
-          plan = plan.replace(/\n$/, '');
+          plan = plan.replace(/\n$/, ''); // drop trailing newline -> no blank line in the fence
 
-          // ONE COMMENT PER WORKING DIRECTORY.
-          //
-          // Earlier versions kept every matrix job's plan in a single shared comment.
-          // That cannot work: a PR/issue comment body is hard-limited to 65536 chars,
-          // and once two or three directories each contribute a large plan the SHARED
-          // body exceeds the limit no matter how much any single job truncates its own
-          // section (it cannot shrink the other jobs' sections). The GitHub API then
-          // rejects the whole comment with HTTP 422 "body is too long".
-          //
-          // Giving each directory its own comment means every comment holds exactly one
-          // plan, so the per-plan truncation below always keeps it under the limit, and
-          // concurrent matrix jobs never contend over the same comment body.
+          // One comment per working directory. A shared comment would exceed GitHub's
+          // 65536-char body limit once several matrix jobs each add a large plan, and a
+          // single job cannot shrink the other jobs' output. A dedicated comment holds
+          // one plan, so the truncation below always keeps it under the limit.
           const marker = `<!-- tf-plan-bot:${process.env.WORKING_DIR} -->`;
 
-          // Build the comment body. The scaffolding (header, table, <details>, fences)
-          // is assembled from an array joined with '\n' so every line is guaranteed
-          // flush-left. This is essential: Markdown treats 4+ leading spaces as an
-          // indented code block, so any YAML indentation leaking into these lines
-          // breaks the collapsible <details> rendering. The plan body is injected
-          // verbatim as its own line(s) so it can be truncated independently below
-          // without disturbing the surrounding scaffolding (a regex dedent would mangle
-          // the plan's own legitimately-indented lines).
+          // Assemble each line flush-left (4+ leading spaces would render as a Markdown
+          // code block and break the <details>). The plan is injected as its own line
+          // so it can be truncated below without disturbing the surrounding scaffolding.
           const buildBody = (planBody, notice) => {
             const lines = [
               marker,
@@ -334,18 +319,17 @@ jobs:
           const SAFETY = 1024; // headroom below the hard cap
           const truncNotice = '> ⚠️ Plan output truncated to fit GitHub\'s comment size limit. See the job summary and logs for the full output.';
 
-          // First attempt with the full plan; truncate only if it overflows.
+          // Truncate only if the plan overflows, keeping the tail so the `Plan: ...`
+          // summary line survives.
           let body = buildBody(plan, '');
           if (body.length > BODY_LIMIT) {
             const overhead = buildBody('', truncNotice).length;
             let budget = BODY_LIMIT - SAFETY - overhead;
             if (budget < 0) budget = 0;
-            // Keep the TAIL so the `Plan: X to add ...` summary line survives.
             body = buildBody(plan.slice(-budget), truncNotice);
           }
 
-          // Find this directory's own comment (if a previous run created one) and
-          // update it in place; otherwise create a fresh one.
+          // Update this directory's comment if a previous run created one, else create it.
           const { data: comments } = await github.rest.issues.listComments({
             issue_number: context.issue.number,
             owner: context.repo.owner,
