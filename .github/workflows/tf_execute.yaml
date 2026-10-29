@@ -335,6 +335,25 @@ jobs:
               // append new section
               body = existing.body + '\n\n---\n' + section.trim();
             }
+          } else {
+            body = `${marker}\n## OpenTofu Plan Results\n*Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*\n` + section.trim();
+          }
+
+          // A single PR/issue comment body is hard-limited to 65536 chars by the
+          // GitHub API. With a matrix build every job appends its own section to the
+          // SAME comment, so even per-plan truncation above is not enough: two large
+          // sections together still blow past the limit and the API rejects the whole
+          // comment with "body is too long" (HTTP 422). Enforce the ceiling on the
+          // final body here, right before the API call, keeping the TAIL so the most
+          // recent section and its `Plan:` summary line survive.
+          const BODY_LIMIT = 65536;
+          if (body.length > BODY_LIMIT) {
+            const overflowNotice =
+              '\n\n> ⚠️ This comment exceeded GitHub\'s 65,536 character limit and was truncated. See the job summaries and logs for the full plan output.';
+            body = overflowNotice + body.slice(-(BODY_LIMIT - overflowNotice.length));
+          }
+
+          if (existing) {
             await github.rest.issues.updateComment({
               comment_id: existing.id,
               owner: context.repo.owner,
@@ -342,7 +361,6 @@ jobs:
               body,
             });
           } else {
-            body = `${marker}\n## OpenTofu Plan Results\n*Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*\n` + section.trim();
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
