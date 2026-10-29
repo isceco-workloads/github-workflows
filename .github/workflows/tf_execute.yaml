@@ -218,13 +218,15 @@ jobs:
       if: ${{ steps.set_execution_type.outputs.type == 'plan' }}
       id: plan
       working-directory: ${{ inputs.terraform_working_directory }}
+      env:
+        PLAN_OUTPUT_FILE: ${{ runner.temp }}/tf_plan_output.txt
       run: |
         if [[ "${{ inputs.use_opentofu }}" == "true" ]]; then
           PLAN_OUTPUT=$(tofu plan -no-color -input=false 2>&1) || true
         else
           PLAN_OUTPUT=$(terraform plan -no-color -input=false 2>&1) || true
         fi
-        PLAN_FILTERED=$(echo "$PLAN_OUTPUT" \
+        echo "$PLAN_OUTPUT" \
           | grep -vE 'Refreshing state\.\.\.|: Reading\.\.\.|: Read complete after' \
           | sed '/^$/N;/^\n$/d' \
           | sed 's/^  - /- /' \
@@ -232,23 +234,23 @@ jobs:
           | sed 's/^  ~ /! /' \
           | sed 's/^      - /  - /' \
           | sed 's/^      + /  + /' \
-          | sed 's/^      ~ /  ! /')
-        echo "stdout<<EOF" >> $GITHUB_OUTPUT
-        echo "$PLAN_FILTERED" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+          | sed 's/^      ~ /  ! /' \
+          > "$PLAN_OUTPUT_FILE"
       continue-on-error: true
 
     - name: Terraform Apply
       if: ${{ steps.set_execution_type.outputs.type == 'apply' }}
       id: apply
       working-directory: ${{ inputs.terraform_working_directory }}
+      env:
+        APPLY_OUTPUT_FILE: ${{ runner.temp }}/tf_apply_output.txt
       run: |
         if [[ "${{ inputs.use_opentofu }}" == "true" ]]; then
           APPLY_OUTPUT=$(tofu apply -auto-approve -no-color -input=false 2>&1) || true
         else
           APPLY_OUTPUT=$(terraform apply -auto-approve -no-color -input=false 2>&1) || true
         fi
-        APPLY_FILTERED=$(echo "$APPLY_OUTPUT" \
+        echo "$APPLY_OUTPUT" \
           | grep -vE 'Refreshing state\.\.\.|: Reading\.\.\.|: Read complete after' \
           | sed '/^$/N;/^\n$/d' \
           | sed 's/^  - /- /' \
@@ -256,10 +258,8 @@ jobs:
           | sed 's/^  ~ /! /' \
           | sed 's/^      - /  - /' \
           | sed 's/^      + /  + /' \
-          | sed 's/^      ~ /  ! /')
-        echo "stdout<<EOF" >> $GITHUB_OUTPUT
-        echo "$APPLY_FILTERED" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
+          | sed 's/^      ~ /  ! /' \
+          > "$APPLY_OUTPUT_FILE"
       continue-on-error: true
 
     # - name: Publish Terraform Plan Artifact
@@ -271,30 +271,65 @@ jobs:
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
       if: ${{ steps.set_execution_type.outputs.type == 'plan' }}
       env:
-        PLAN: ${{ steps.plan.outputs.stdout }}
+        PLAN_OUTPUT_FILE: ${{ runner.temp }}/tf_plan_output.txt
         WORKING_DIR: ${{ inputs.terraform_working_directory }}
       with:
         github-token: ${{ secrets.GITHUB_TOKEN }}
         script: |
-          const marker = '<!-- tf-plan-bot -->';
-          const section = `### 📁 \`${process.env.WORKING_DIR}\`
+          const fs = require('fs');
+          const planFile = process.env.PLAN_OUTPUT_FILE;
+          let plan = fs.existsSync(planFile) ? fs.readFileSync(planFile, 'utf8') : '';
+          plan = plan.replace(/\n$/, ''); // drop trailing newline -> no blank line in the fence
 
-          | Check | Result |
-          |---|---|
-          | 🖌 Format | \`${{ steps.fmt.outcome }}\` |
-          | ⚙️ Init | \`${{ steps.init.outcome }}\` |
-          | 🤖 Validate | \`${{ steps.validate.outcome }}\` |
-          | 📖 Plan | \`${{ steps.plan.outcome }}\` |
+          // One comment per working directory. A shared comment would exceed GitHub's
+          // 65536-char body limit once several matrix jobs each add a large plan, and a
+          // single job cannot shrink the other jobs' output. A dedicated comment holds
+          // one plan, so the truncation below always keeps it under the limit.
+          const marker = `<!-- tf-plan-bot:${process.env.WORKING_DIR} -->`;
 
-          <details><summary>Show Plan</summary>
+          // Assemble each line flush-left (4+ leading spaces would render as a Markdown
+          // code block and break the <details>). The plan is injected as its own line
+          // so it can be truncated below without disturbing the surrounding scaffolding.
+          const buildBody = (planBody, notice) => {
+            const lines = [
+              marker,
+              '## OpenTofu Plan Results',
+              `*Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*`,
+              `### 📁 \`${process.env.WORKING_DIR}\``,
+              '',
+              '| Check | Result |',
+              '|---|---|',
+              `| 🖌 Format | \`${{ steps.fmt.outcome }}\` |`,
+              `| ⚙️ Init | \`${{ steps.init.outcome }}\` |`,
+              `| 🤖 Validate | \`${{ steps.validate.outcome }}\` |`,
+              `| 📖 Plan | \`${{ steps.plan.outcome }}\` |`,
+              '',
+              '<details><summary>Show Plan</summary>',
+              '',
+              '```diff',
+              planBody,
+              '```',
+            ];
+            if (notice) lines.push(notice);
+            lines.push('</details>');
+            return lines.join('\n');
+          };
 
-          \`\`\`diff
-          ${process.env.PLAN}
-          \`\`\`
+          const BODY_LIMIT = 65536;
+          const SAFETY = 1024; // headroom below the hard cap
+          const truncNotice = '> ⚠️ Plan output truncated to fit GitHub\'s comment size limit. See the job summary and logs for the full output.';
 
-          </details>
-          <!-- tf-plan-section:${process.env.WORKING_DIR} -->`;
+          // Truncate only if the plan overflows, keeping the tail so the `Plan: ...`
+          // summary line survives.
+          let body = buildBody(plan, '');
+          if (body.length > BODY_LIMIT) {
+            const overhead = buildBody('', truncNotice).length;
+            let budget = BODY_LIMIT - SAFETY - overhead;
+            if (budget < 0) budget = 0;
+            body = buildBody(plan.slice(-budget), truncNotice);
+          }
 
+          // Update this directory's comment if a previous run created one, else create it.
           const { data: comments } = await github.rest.issues.listComments({
             issue_number: context.issue.number,
             owner: context.repo.owner,
@@ -302,17 +337,7 @@ jobs:
           });
           const existing = comments.find(c => c.body.includes(marker));
 
-          let body;
           if (existing) {
-            const sectionMarker = `<!-- tf-plan-section:${process.env.WORKING_DIR} -->`;
-            if (existing.body.includes(sectionMarker)) {
-              // replace existing section for this working directory
-              const re = new RegExp(`### 📁 \\\`${process.env.WORKING_DIR.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')}\\\`[\\s\\S]*?${sectionMarker}`);
-              body = existing.body.replace(re, section.trim());
-            } else {
-              // append new section
-              body = existing.body + '\n\n---\n' + section.trim();
-            }
             await github.rest.issues.updateComment({
               comment_id: existing.id,
               owner: context.repo.owner,
@@ -320,7 +345,6 @@ jobs:
               body,
             });
           } else {
-            body = `${marker}\n## OpenTofu Plan Results\n*Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Workflow: \`${{ github.workflow }}\`*\n` + section.trim();
             await github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
@@ -332,7 +356,8 @@ jobs:
     - name: Write Plan summary
       if: ${{ steps.set_execution_type.outputs.type == 'plan' }}
       env:
-        PLAN: ${{ steps.plan.outputs.stdout }}
+        PLAN_OUTPUT_FILE: ${{ runner.temp }}/tf_plan_output.txt
+        SUMMARY_CAP_BYTES: "102400"
       run: |
         cat >> $GITHUB_STEP_SUMMARY << 'EOF'
         ### 📁 `${{ inputs.terraform_working_directory }}`
@@ -348,17 +373,33 @@ jobs:
 
         ```diff
         EOF
-        echo "$PLAN" >> $GITHUB_STEP_SUMMARY
+        if [ -f "$PLAN_OUTPUT_FILE" ]; then
+          TOTAL=$(wc -c < "$PLAN_OUTPUT_FILE")
+          CAP="$SUMMARY_CAP_BYTES"
+          HALF=$((CAP / 2))
+          if [ "$TOTAL" -gt "$CAP" ]; then
+            head -c "$HALF" "$PLAN_OUTPUT_FILE" >> $GITHUB_STEP_SUMMARY
+            printf '\n... [middle elided — see job logs for full output] ...\n' >> $GITHUB_STEP_SUMMARY
+            tail -c "$HALF" "$PLAN_OUTPUT_FILE" >> $GITHUB_STEP_SUMMARY
+          else
+            cat "$PLAN_OUTPUT_FILE" >> $GITHUB_STEP_SUMMARY
+          fi
+        fi
         cat >> $GITHUB_STEP_SUMMARY << 'EOF'
         ```
 
         </details>
         EOF
+        if [ -f "$PLAN_OUTPUT_FILE" ] && [ "${TOTAL:-0}" -gt "$SUMMARY_CAP_BYTES" ]; then
+          echo "> ⚠️ Output truncated: showing first/last $((SUMMARY_CAP_BYTES / 2)) of $TOTAL bytes. See job logs for full output." >> $GITHUB_STEP_SUMMARY
+        fi
+
 
     - name: Write Apply summary
       if: ${{ steps.set_execution_type.outputs.type == 'apply' }}
       env:
-        APPLY: ${{ steps.apply.outputs.stdout }}
+        APPLY_OUTPUT_FILE: ${{ runner.temp }}/tf_apply_output.txt
+        SUMMARY_CAP_BYTES: "102400"
       run: |
         cat >> $GITHUB_STEP_SUMMARY << 'EOF'
         ### 📁 `${{ inputs.terraform_working_directory }}`
@@ -374,9 +415,15 @@ jobs:
 
         ```diff
         EOF
-        echo "$APPLY" >> $GITHUB_STEP_SUMMARY
+        if [ -f "$APPLY_OUTPUT_FILE" ]; then
+          TOTAL=$(wc -c < "$APPLY_OUTPUT_FILE")
+          tail -c "$SUMMARY_CAP_BYTES" "$APPLY_OUTPUT_FILE" >> $GITHUB_STEP_SUMMARY
+        fi
         cat >> $GITHUB_STEP_SUMMARY << 'EOF'
         ```
 
         </details>
         EOF
+        if [ -f "$APPLY_OUTPUT_FILE" ] && [ "${TOTAL:-0}" -gt "$SUMMARY_CAP_BYTES" ]; then
+          echo "> ⚠️ Output truncated: showing last $SUMMARY_CAP_BYTES of $TOTAL bytes. See job logs for full output." >> $GITHUB_STEP_SUMMARY
+        fi
