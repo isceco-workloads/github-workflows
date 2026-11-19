@@ -2,7 +2,7 @@
 # Controlled decommissioning of a chatbot (tofu destroy), central reusable workflow.
 #
 # Called by .github/workflows/destroy.yml in the environment repos (dev, gever-int, shared-int, shared-prod).
-# Procedure and configuration: github-workflows/docs/decommission.md
+# Procedure and configuration: github-workflows/docs/chatbot-destroy-docs.md
 #
 # Two deliberate runs without a four-eyes requirement (no GitHub Teams licence, no required reviewers):
 #   Run 1 (mode=plan):  A person creates plans and the artifact and reviews the summary.
@@ -273,10 +273,14 @@ jobs:
               | .address ] | unique[]
           ' "${LOG_DIR}/state.json" > "${PLAN_DIR}/protection_targets.txt"
           mapfile -t TARGETS < "${PLAN_DIR}/protection_targets.txt"
-          # An empty -target list would silently create the FULL plan: abort explicitly.
+          # No protected resources left (e.g. partially decommissioned chatbot: Cognito/RDS already deleted):
+          # there is no deletion protection to switch off. Do NOT run tofu plan here, because an empty
+          # -target list would silently create the FULL plan. Record "no changes" instead; phase 2 then
+          # skips the protection apply. Whether anything is left to delete is checked by the destroy plan.
           if [ "${#TARGETS[@]}" -eq 0 ]; then
-            echo "::error::No aws_cognito_user_pool or aws_rds_cluster found in the state of the chatbot. Without targets no protection plan is created (a plan without -target would cover the whole state). Check the chatbot name and the state (probably already removed)."
-            exit 1
+            echo "::notice::No aws_cognito_user_pool or aws_rds_cluster in the state of the chatbot (probably already deleted). No protection plan is created; step 1 is skipped."
+            echo '[]' > "${PLAN_DIR}/protection_changes.json"
+            exit 0
           fi
           TARGET_ARGS=()
           for addr in "${TARGETS[@]}"; do
@@ -296,6 +300,11 @@ jobs:
         run: |
           set -euo pipefail
           PLAN_DIR="${RUNNER_TEMP}/decommission"; LOG_DIR="${RUNNER_TEMP}/decommission-logs"
+          # No protection plan (no protected resources left, see previous step): nothing to check.
+          if [ ! -f "${PLAN_DIR}/protection.tfplan" ]; then
+            echo "No protection plan (no protected resources in the state). Protection changes: $(cat "${PLAN_DIR}/protection_changes.json")"
+            exit 0
+          fi
           tofu show -json "${PLAN_DIR}/protection.tfplan" > "${LOG_DIR}/protection.json"
           # Only updates to aws_cognito_user_pool and aws_rds_cluster that change nothing but the attribute
           # deletion_protection are allowed. Everything else (drift, create/delete) aborts.
@@ -382,7 +391,11 @@ jobs:
               cat "$f"
             fi
           }
-          tofu show -no-color "${PLAN_DIR}/protection.tfplan" > "${LOG_DIR}/protection_show.txt"
+          if [ -f "${PLAN_DIR}/protection.tfplan" ]; then
+            tofu show -no-color "${PLAN_DIR}/protection.tfplan" > "${LOG_DIR}/protection_show.txt"
+          else
+            echo "No protected resources (aws_cognito_user_pool, aws_rds_cluster) left in the state. Step 1 is skipped." > "${LOG_DIR}/protection_show.txt"
+          fi
           tofu show -no-color "${PLAN_DIR}/destroy.tfplan" > "${LOG_DIR}/destroy_show.txt"
           {
             echo "## Decommission plan for \`${CHATBOT}\`"
