@@ -261,8 +261,32 @@ jobs:
           set -euo pipefail
           PLAN_DIR="${RUNNER_TEMP}/decommission"; LOG_DIR="${RUNNER_TEMP}/decommission-logs"
           mkdir -p "$PLAN_DIR" "$LOG_DIR"
+
+          # The plan is limited via -target to the resources whose deletion protection is switched off.
+          # Drift elsewhere (e.g. null_resource, unconfirmed SNS subscriptions) is irrelevant for the
+          # decommissioning and must not block it. The module paths differ per chatbot, therefore the
+          # addresses are read from the state (no refresh, state only), recursively through all child modules.
+          tofu show -json > "${LOG_DIR}/state.json"
+          jq -r '
+            [ .values.root_module | recurse(.child_modules[]?) | .resources[]?
+              | select(.mode == "managed" and (.type == "aws_cognito_user_pool" or .type == "aws_rds_cluster"))
+              | .address ] | unique[]
+          ' "${LOG_DIR}/state.json" > "${PLAN_DIR}/protection_targets.txt"
+          mapfile -t TARGETS < "${PLAN_DIR}/protection_targets.txt"
+          # An empty -target list would silently create the FULL plan: abort explicitly.
+          if [ "${#TARGETS[@]}" -eq 0 ]; then
+            echo "::error::No aws_cognito_user_pool or aws_rds_cluster found in the state of the chatbot. Without targets no protection plan is created (a plan without -target would cover the whole state). Check the chatbot name and the state (probably already removed)."
+            exit 1
+          fi
+          TARGET_ARGS=()
+          for addr in "${TARGETS[@]}"; do
+            TARGET_ARGS+=("-target=${addr}")
+          done
+          echo "Protection plan limited to ${#TARGETS[@]} resource(s):"
+          printf '  %s\n' "${TARGETS[@]}"
+
           set +e
-          tofu plan -input=false -no-color -out="${PLAN_DIR}/protection.tfplan" 2>&1 | tee "${LOG_DIR}/protection_plan.txt"
+          tofu plan -input=false -no-color "${TARGET_ARGS[@]}" -out="${PLAN_DIR}/protection.tfplan" 2>&1 | tee "${LOG_DIR}/protection_plan.txt"
           rc=${PIPESTATUS[0]}
           set -e
           exit "$rc"
@@ -275,6 +299,7 @@ jobs:
           tofu show -json "${PLAN_DIR}/protection.tfplan" > "${LOG_DIR}/protection.json"
           # Only updates to aws_cognito_user_pool and aws_rds_cluster that change nothing but the attribute
           # deletion_protection are allowed. Everything else (drift, create/delete) aborts.
+          # The plan only covers the -target resources (and their dependencies), not the whole state.
           set +e
           jq -c '
             def changed_keys: . as $r
@@ -286,7 +311,7 @@ jobs:
                   or (((changed_keys - ["deletion_protection"]) | length) > 0)
                 ) | .address ] as $bad
             | if ($bad | length) > 0
-              then error("Disallowed changes in protection plan: " + ($bad | join(", ")) + ". Complete a normal deploy first.")
+              then error("Disallowed changes in protection plan: " + ($bad | join(", ")) + ". Only aws_cognito_user_pool/aws_rds_cluster updates that change nothing but deletion_protection are allowed; the plan is limited via -target to these resources (and their dependencies). Check the plan output of the previous step and protection.json: either a change outside the allow list (e.g. in a dependency of the targeted resources) or drift of the targeted resources. Complete a normal deploy first if it is drift.")
               else [ $chg[].address ] end
           ' "${LOG_DIR}/protection.json" > "${PLAN_DIR}/protection_changes.json" 2> "${LOG_DIR}/allowlist_err.txt"
           rc=$?
@@ -372,6 +397,10 @@ jobs:
             echo '```'
             echo
             echo "### Step 1: Disable deletion protection"
+            echo "Plan limited via \`-target\` to:"
+            echo '```'
+            cat "${PLAN_DIR}/protection_targets.txt"
+            echo '```'
             echo '```diff'
             cap_file "${LOG_DIR}/protection_show.txt"
             echo '```'
@@ -937,7 +966,21 @@ jobs:
     runs-on: ${{ inputs.github_runner }}
     permissions: {}
     steps:
-      - name: Notice
+      # Failure before the first real change (validate, plan, approve): nothing was changed in the real system.
+      - name: Notice (nothing changed)
+        if: needs.protection_off.result != 'failure' && needs.empty_buckets.result != 'failure' && needs.destroy.result != 'failure'
+        env:
+          CHATBOT: ${{ needs.validate.outputs.chatbot }}
+        run: |
+          {
+            echo "## Decommission failed"
+            echo "The failure occurred before the first change of the real system (validation, plan or approval). \`${CHATBOT}\` is unchanged."
+            echo "Fix the cause (see the log of the failed job), then start a NEW run with \`mode=plan\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Failure in phase 2 (apply of the protection plan, emptying buckets, destroy): real changes are possible.
+      - name: Notice (possibly partially torn down)
+        if: needs.protection_off.result == 'failure' || needs.empty_buckets.result == 'failure' || needs.destroy.result == 'failure'
         env:
           CHATBOT: ${{ needs.validate.outputs.chatbot }}
         run: |

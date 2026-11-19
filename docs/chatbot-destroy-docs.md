@@ -27,7 +27,7 @@ no `|| true` and no `continue-on-error`.
 3. Then the following run one after another: disable deletion protection, empty S3 buckets, `tofu destroy`, check "state empty".
 4. Second pull request: delete `chatbots/<name>/`. The guard checks that the state is empty (or does not exist).
 
-If aborted midway, the chatbot may be partially torn down. Then fix the cause and restart with `mode=plan`.
+If aborted midway in phase 2, the chatbot may be partially torn down (an abort in phase 1 changes nothing). Then fix the cause and restart with `mode=plan`.
 
 ## Configuration
 
@@ -59,9 +59,32 @@ change state or reality, so a destroy plan created in advance would be stale aft
 The root module `chatbots/<name>/main.tf` declares no variables for this; the module reads the values from `settings.json`.
 `-var` or `TF_VAR_*` would therefore have no effect. The workflow instead overwrites, in the runner checkout (never committed),
 `cognito_deletion_protection = "INACTIVE"` and `pgvector_deletion_protection = false` via `jq`, identically in every job.
-The protection plan may only contain `update` changes to `aws_cognito_user_pool` and `aws_rds_cluster` that affect only
-`deletion_protection`. Anything else (drift, pending changes) aborts: complete a normal deploy first.
+The protection plan is limited via `-target` to the `aws_cognito_user_pool` and `aws_rds_cluster` resources of the state.
+The addresses (including module paths and `for_each` keys) are read dynamically from the state (`tofu show -json`) and
+stored as `protection_targets.txt` in the plan artifact. If none is found, the plan job aborts (a plan without `-target` would cover the whole state).
+The protection plan may only contain `update` changes to these two types that affect only `deletion_protection`.
+Anything else aborts with `Disallowed changes in protection plan`. Possible causes: a change in a dependency of the targeted
+resources (`-target` includes dependencies), or drift of the targeted resources themselves. Check the plan output of the step
+and `protection.json`; if it is drift, complete a normal deploy first.
+Drift on other resources no longer blocks the decommissioning.
+The step "Apply protection plan" applies exactly the stored `protection.tfplan` (unchanged).
 DynamoDB tables have no deletion protection in the code.
+
+### Decision: protection plan per `-target` instead of full plan
+
+- Context: the full plan failed on drift unrelated to the decommissioning, e.g. `null_resource.build_and_upload`
+  (replaced on every plan, trigger paths depend on the build drive) and 20+ unconfirmed
+  `aws_sns_topic_subscription` (AWS deletes them after 48 h, the plan shows `create`).
+- Decision: limit the plan to the protection resources via `-target`, keep the allow list strict.
+- Rejected alternative: extend the allow list with `null_resource` and SNS subscriptions. The apply of the stored plan
+  would then trigger the build and send 20+ confirmation emails during a decommissioning.
+- Consequences: unrelated drift no longer blocks. Residual risk: `-target` also plans the dependencies of the targeted
+  resources; drift there still aborts (see above). The modules (`null_resource`, SNS) are fixed separately.
+
+## Failure notice
+
+If a job fails in phase 1 or in the approval (`validate`, `plan`, `approve`), nothing was changed in the real system and the summary says so.
+The notice "may be partially torn down" only appears when `protection_off`, `empty_buckets` or `destroy` failed.
 
 ## S3 buckets
 
