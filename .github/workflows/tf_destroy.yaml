@@ -1,0 +1,948 @@
+
+# Controlled decommissioning of a chatbot (tofu destroy), central reusable workflow.
+#
+# Called by .github/workflows/destroy.yml in the environment repos (dev, gever-int, shared-int, shared-prod).
+# Procedure and configuration: github-workflows/docs/decommission.md
+#
+# Two deliberate runs without a four-eyes requirement (no GitHub Teams licence, no required reviewers):
+#   Run 1 (mode=plan):  A person creates plans and the artifact and reviews the summary.
+#   Run 2 (mode=apply): Deliberate approval in the second run, the same person is allowed.
+#                       Start with plan_run_id of run 1. Job `approve` checks via the GitHub API that the
+#                       plan run belongs to this repo/chatbot/commit, succeeded and is not too old,
+#                       and aborts on any doubt (fail-closed).
+#
+# There is NO four-eyes requirement any more (no approver list, no comparison of persons).
+# Protection = two deliberate runs + plan review in the summary + confirmation by input (confirm) + audit log
+# (run history and approval summary with person). Recommendation: keep branch protection/review for changes to
+# the workflow and the callers. Alternative when a licence is available: GitHub Environment with
+# required reviewers.
+#
+# Deviation from "exactly this plan":
+#   `tofu apply <planfile>` requires unchanged state. The steps "disable deletion protection" and
+#   "empty buckets" however change state or reality, so a destroy plan created in advance would be
+#   stale afterwards. Therefore: the plan for deletion protection is applied exactly (stale = abort).
+#   The destroy plan is regenerated in the apply run and only applied if the list of resources to delete
+#   is IDENTICAL to the approved list (destroy_addresses.txt from run 1).
+#
+# Deliberately NO `|| true` and no `continue-on-error` in this workflow: exit codes are remembered,
+# the output is logged via tee, and the step then exits with the remembered code.
+#
+# `environment:` (required reviewers) is deliberately NOT set here, because it has no effect without a Teams
+# licence and the behaviour of an empty environment expression was not verified. With a licence, additionally
+# add `environment: <name>` to the jobs `protection_off` and `destroy` (never as the only safeguard).
+#
+# Naming note: workflow name, job IDs and step IDs are unchanged (referenced by deploy.yml guard and docs).
+# Display names and messages are English only.
+# ===========================================================================
+name: Decommission Chatbot (tofu destroy)
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: 'plan (create plans) or apply (deliberate approval in the second run, execute)'
+        required: true
+        type: string
+      chatbot:
+        description: 'Name of the chatbot (directory under chatbots/), only [a-z0-9-_]'
+        required: true
+        type: string
+      confirm:
+        description: 'Enter the chatbot name again to confirm'
+        required: true
+        type: string
+      plan_run_id:
+        description: 'Only mode=apply: run ID of the successful plan run'
+        default: ''
+        required: false
+        type: string
+      max_plan_age_hours:
+        description: 'Maximum age of the plan run in hours'
+        default: 24
+        required: false
+        type: number
+      aws_oidc_role_arn:
+        description: 'AWS OIDC role ARN (alternative to the secret AWS_OIDC_ROLE_ARN)'
+        default: ''
+        required: false
+        type: string
+      aws_oidc_role_duration_seconds:
+        description: 'Duration of the AWS session in seconds'
+        default: 900
+        required: false
+        type: number
+      aws_default_region:
+        description: 'AWS default region'
+        default: 'eu-central-2'
+        required: false
+        type: string
+      enable_ecr_oci_modules:
+        description: 'ECR authentication for OCI modules'
+        default: false
+        required: false
+        type: boolean
+      ecr_oci_registry_ids:
+        description: 'Comma-separated ECR registry IDs'
+        default: ''
+        required: false
+        type: string
+      aws_oidc_role_from_secret:
+        description: 'true if the role is provided via the secret AWS_OIDC_ROLE_ARN'
+        default: false
+        required: false
+        type: boolean
+      github_runner:
+        description: 'Runner (CodeBuild label of the caller or ubuntu-latest)'
+        default: 'ubuntu-latest'
+        required: false
+        type: string
+      terraform_version:
+        description: 'OpenTofu version'
+        required: true
+        type: string
+    secrets:
+      GH_APP_ID:
+        required: false
+      GH_APP_PRIVATE_KEY:
+        required: false
+      AWS_OIDC_ROLE_ARN:
+        required: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Validate inputs and preconditions (no AWS)
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate inputs
+    runs-on: ${{ inputs.github_runner }}
+    permissions:
+      contents: read
+    outputs:
+      chatbot: ${{ steps.check.outputs.chatbot }}
+      mode: ${{ steps.check.outputs.mode }}
+      plan_run_id: ${{ steps.check.outputs.plan_run_id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Validate inputs
+        id: check
+        env:
+          CHATBOT: ${{ inputs.chatbot }}
+          CONFIRM: ${{ inputs.confirm }}
+          MODE: ${{ inputs.mode }}
+          PLAN_RUN_ID: ${{ inputs.plan_run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          [ "$EVENT_NAME" = "workflow_dispatch" ] || fail "Decommission is only allowed via workflow_dispatch (current: ${EVENT_NAME})."
+          [ "$REF" = "refs/heads/main" ] || fail "Decommission is only allowed on main (current: ${REF})."
+
+          [[ "$MODE" == "plan" || "$MODE" == "apply" ]] || fail "mode must be 'plan' or 'apply'."
+          [[ "$CHATBOT" =~ ^[a-z0-9_-]+$ ]] || fail "chatbot may only consist of [a-z0-9-_] and must not be empty."
+          [ "$CHATBOT" = "$CONFIRM" ] || fail "confirm does not match chatbot."
+          if [ "$MODE" = "apply" ]; then
+            [[ "$PLAN_RUN_ID" =~ ^[0-9]+$ ]] || fail "mode=apply needs a numeric plan_run_id."
+          else
+            PLAN_RUN_ID=""
+          fi
+          [ -f "chatbots/${CHATBOT}/settings.json" ] || fail "chatbots/${CHATBOT}/settings.json does not exist. Chatbot unknown or already removed."
+
+          {
+            echo "chatbot=${CHATBOT}"
+            echo "mode=${MODE}"
+            echo "plan_run_id=${PLAN_RUN_ID}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Inputs ok: chatbot=${CHATBOT}, mode=${MODE}"
+
+  # ---------------------------------------------------------------------------
+  # Phase 1: Create plans and store them as an artifact
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Create plan (phase 1)
+    needs: validate
+    if: needs.validate.outputs.mode == 'plan'
+    runs-on: ${{ inputs.github_runner }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GH_APP_CONFIGURED: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_PRIVATE_KEY != '' }}
+    steps:
+      - name: Get GitHub App token
+        id: github_app_token
+        if: env.GH_APP_CONFIGURED == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Set up access to private modules
+        if: env.GH_APP_CONFIGURED == 'true'
+        env:
+          GH_APP_TOKEN: ${{ steps.github_app_token.outputs.token }}
+        run: |
+          git config --global url."https://x-access-token:${GH_APP_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          # Do not persist credentials so that access to private modules is not overwritten
+          persist-credentials: false
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
+        with:
+          tofu_version: ${{ inputs.terraform_version }}
+          tofu_wrapper: false
+
+      - name: Configure AWS credentials
+        if: ${{ inputs.aws_oidc_role_arn != '' || inputs.aws_oidc_role_from_secret }}
+        # Taken over unchanged from tf_execute.yaml (also @v1 there and not pinned by SHA).
+        uses: isceco/github-workflows/.github/actions/aws/configure_credentials@v1
+        with:
+          AWS_ROLE_ARN_TO_ASSUME: ${{ secrets.AWS_OIDC_ROLE_ARN || inputs.aws_oidc_role_arn }}
+          AWS_REGION: ${{ inputs.aws_default_region }}
+          AWS_SESSION_NAME: GitHubActions-${{ github.run_id }}
+          AWS_SESSION_DURATION: ${{ inputs.aws_oidc_role_duration_seconds }}
+
+      - name: Set up ECR authentication for OCI modules
+        if: ${{ inputs.enable_ecr_oci_modules && inputs.ecr_oci_registry_ids != '' }}
+        env:
+          ECR_REGISTRY_IDS: ${{ inputs.ecr_oci_registry_ids }}
+          AWS_DEFAULT_REGION_INPUT: ${{ inputs.aws_default_region }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.docker
+          AUTHS='{}'
+          IFS=',' read -ra REGISTRY_IDS <<< "${ECR_REGISTRY_IDS}"
+          for registry_id in "${REGISTRY_IDS[@]}"; do
+            registry_id="$(echo "${registry_id}" | xargs)"
+            [ -n "${registry_id}" ] || continue
+            ECR_TOKEN="$(aws ecr get-login-password --region "${AWS_DEFAULT_REGION_INPUT}")"
+            ECR_REGISTRY="${registry_id}.dkr.ecr.${AWS_DEFAULT_REGION_INPUT}.amazonaws.com"
+            AUTH="$(printf 'AWS:%s' "${ECR_TOKEN}" | base64 -w 0)"
+            AUTHS="$(jq -c --arg reg "${ECR_REGISTRY}" --arg auth "${AUTH}" \
+              '.[$reg] = {auth: $auth}' <<< "${AUTHS}")"
+          done
+          jq -n --argjson auths "${AUTHS}" '{auths: $auths}' > ~/.docker/config.json
+
+      - name: Disable deletion protection in settings.json (runner checkout only)
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          # The root module declares no variables for this; the module reads the values from settings.json.
+          # The patch applies to this job only (never committed) and is identical in all jobs.
+          jq '.cognito_deletion_protection = "INACTIVE" | .pgvector_deletion_protection = false' settings.json > "${RUNNER_TEMP}/settings.patched.json"
+          cp "${RUNNER_TEMP}/settings.patched.json" settings.json
+
+      - name: tofu init
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: tofu init -input=false -no-color
+
+      - name: Plan deletion protection (phase 1)
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          PLAN_DIR="${RUNNER_TEMP}/decommission"; LOG_DIR="${RUNNER_TEMP}/decommission-logs"
+          mkdir -p "$PLAN_DIR" "$LOG_DIR"
+          set +e
+          tofu plan -input=false -no-color -out="${PLAN_DIR}/protection.tfplan" 2>&1 | tee "${LOG_DIR}/protection_plan.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          exit "$rc"
+
+      - name: Check allow list for protection plan
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          PLAN_DIR="${RUNNER_TEMP}/decommission"; LOG_DIR="${RUNNER_TEMP}/decommission-logs"
+          tofu show -json "${PLAN_DIR}/protection.tfplan" > "${LOG_DIR}/protection.json"
+          # Only updates to aws_cognito_user_pool and aws_rds_cluster that change nothing but the attribute
+          # deletion_protection are allowed. Everything else (drift, create/delete) aborts.
+          set +e
+          jq -c '
+            def changed_keys: . as $r
+              | [ ($r.change.after // {}) | to_entries[] | select(.value != ($r.change.before[.key])) | .key ];
+            [ .resource_changes[]? | select(.mode == "managed") | select((.change.actions | index("no-op")) | not) ] as $chg
+            | [ $chg[] | select(
+                  (.change.actions != ["update"])
+                  or ((.type == "aws_cognito_user_pool" or .type == "aws_rds_cluster") | not)
+                  or (((changed_keys - ["deletion_protection"]) | length) > 0)
+                ) | .address ] as $bad
+            | if ($bad | length) > 0
+              then error("Disallowed changes in protection plan: " + ($bad | join(", ")) + ". Complete a normal deploy first.")
+              else [ $chg[].address ] end
+          ' "${LOG_DIR}/protection.json" > "${PLAN_DIR}/protection_changes.json" 2> "${LOG_DIR}/allowlist_err.txt"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::$(cat "${LOG_DIR}/allowlist_err.txt")"
+            exit "$rc"
+          fi
+          echo "Protection changes: $(cat "${PLAN_DIR}/protection_changes.json")"
+
+      - name: Plan destroy (phase 1)
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          PLAN_DIR="${RUNNER_TEMP}/decommission"; LOG_DIR="${RUNNER_TEMP}/decommission-logs"
+          set +e
+          tofu plan -destroy -input=false -no-color -out="${PLAN_DIR}/destroy.tfplan" 2>&1 | tee "${LOG_DIR}/destroy_plan.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          exit "$rc"
+
+      - name: Create list of resources to delete
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          PLAN_DIR="${RUNNER_TEMP}/decommission"; LOG_DIR="${RUNNER_TEMP}/decommission-logs"
+          tofu show -json "${PLAN_DIR}/destroy.tfplan" > "${LOG_DIR}/destroy.json"
+          set +e
+          jq -r '
+            .resource_changes[]?
+            | select(.mode == "managed")
+            | select((.change.actions | index("no-op")) | not)
+            | if .change.actions == ["delete"] then .address
+              else error("Unexpected action for " + .address + ": " + (.change.actions | join(",")))
+              end
+          ' "${LOG_DIR}/destroy.json" 2> "${LOG_DIR}/addresses_err.txt" | sort > "${PLAN_DIR}/destroy_addresses.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::$(cat "${LOG_DIR}/addresses_err.txt")"
+            exit "$rc"
+          fi
+          if [ ! -s "${PLAN_DIR}/destroy_addresses.txt" ]; then
+            echo "::error::The destroy plan contains no resources. The chatbot has probably already been removed."
+            exit 1
+          fi
+          echo "Resources to delete: $(wc -l < "${PLAN_DIR}/destroy_addresses.txt")"
+
+      - name: Write summary
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        env:
+          SUMMARY_CAP_BYTES: "102400"
+          CHATBOT: ${{ needs.validate.outputs.chatbot }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          PLAN_DIR="${RUNNER_TEMP}/decommission"; LOG_DIR="${RUNNER_TEMP}/decommission-logs"
+          cap_file() {
+            # prints a file truncated: beginning and end if larger than SUMMARY_CAP_BYTES
+            local f="$1" total half
+            total=$(wc -c < "$f")
+            half=$((SUMMARY_CAP_BYTES / 2))
+            if [ "$total" -gt "$SUMMARY_CAP_BYTES" ]; then
+              head -c "$half" "$f"
+              printf '\n... [middle truncated, see job log for the full output] ...\n'
+              tail -c "$half" "$f"
+            else
+              cat "$f"
+            fi
+          }
+          tofu show -no-color "${PLAN_DIR}/protection.tfplan" > "${LOG_DIR}/protection_show.txt"
+          tofu show -no-color "${PLAN_DIR}/destroy.tfplan" > "${LOG_DIR}/destroy_show.txt"
+          {
+            echo "## Decommission plan for \`${CHATBOT}\`"
+            echo
+            echo "**Approval:** Deliberate approval in the second run (the same person is allowed): start the workflow with \`mode=apply\`, \`chatbot=${CHATBOT}\`, \`confirm=${CHATBOT}\` and \`plan_run_id=${RUN_ID}\`."
+            echo
+            echo "No retention, no backup: All data of the chatbot is irrevocably lost."
+            echo
+            echo "### Resources to delete"
+            echo '```'
+            cat "${PLAN_DIR}/destroy_addresses.txt"
+            echo '```'
+            echo
+            echo "### Step 1: Disable deletion protection"
+            echo '```diff'
+            cap_file "${LOG_DIR}/protection_show.txt"
+            echo '```'
+            echo
+            echo "### Step 2: Destroy plan"
+            echo '```diff'
+            cap_file "${LOG_DIR}/destroy_show.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: decommission-${{ needs.validate.outputs.chatbot }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/decommission/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Phase 2: Check approval (plan run assignment, fail-closed)
+  # ---------------------------------------------------------------------------
+  approve:
+    name: Check approval
+    needs: validate
+    if: needs.validate.outputs.mode == 'apply'
+    runs-on: ${{ inputs.github_runner }}
+    permissions:
+      actions: read
+    steps:
+      - name: Check approval against plan run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          API_URL: ${{ github.api_url }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          MAX_AGE_HOURS: ${{ inputs.max_plan_age_hours }}
+          CHATBOT: ${{ needs.validate.outputs.chatbot }}
+          PLAN_RUN_ID: ${{ needs.validate.outputs.plan_run_id }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          api() {
+            curl --fail --silent --show-error \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${API_URL}/repos/${REPO}/$1"
+          }
+
+          [[ "$MAX_AGE_HOURS" =~ ^[0-9]+$ ]] || fail "max_plan_age_hours must be an integer."
+
+          if ! PLAN_RUN="$(api "actions/runs/${PLAN_RUN_ID}")"; then
+            fail "Plan run ${PLAN_RUN_ID} could not be read."
+          fi
+          if ! THIS_RUN="$(api "actions/runs/${RUN_ID}")"; then
+            fail "Current run ${RUN_ID} could not be read."
+          fi
+
+          pr() { jq -r "$1" <<< "$PLAN_RUN"; }
+          [ "$(pr '.status')" = "completed" ]            || fail "Plan run is not completed."
+          [ "$(pr '.conclusion')" = "success" ]          || fail "Plan run was not successful."
+          [ "$(pr '.event')" = "workflow_dispatch" ]     || fail "Plan run was not started via workflow_dispatch."
+          [ "$(pr '.head_branch')" = "main" ]            || fail "Plan run did not run on main."
+          [ "$(pr '.head_sha')" = "$SHA" ]               || fail "Plan run and apply run have different commits (main has changed). Plan again."
+          [ "$(pr '.repository.full_name')" = "$REPO" ]  || fail "Plan run belongs to a different repository."
+          [ "$(pr '.run_attempt')" = "1" ]               || fail "Plan run is a re-run (run_attempt != 1). Plan again."
+          [ "$(pr '.path')" = "$(jq -r '.path' <<< "$THIS_RUN")" ] || fail "Plan run belongs to a different workflow."
+
+          STARTED="$(pr '.run_started_at // .created_at')"
+          AGE_S=$(( $(date -u +%s) - $(date -u -d "$STARTED" +%s) ))
+          [ "$AGE_S" -ge 0 ] || fail "Plan run is in the future. Aborting."
+          [ "$AGE_S" -le $(( MAX_AGE_HOURS * 3600 )) ] || fail "Plan run is older than ${MAX_AGE_HOURS} hours. Plan again."
+
+          # Person of the plan run for the audit log only (no comparison of persons, the same person is allowed)
+          PLAN_ACTOR="$(pr '.actor.login // "unknown"')"
+
+          # The artifact must match the chatbot and the plan run and must not be expired
+          if ! ARTIFACTS="$(api "actions/runs/${PLAN_RUN_ID}/artifacts?per_page=100")"; then
+            fail "Artifacts of the plan run could not be read."
+          fi
+          NAME="decommission-${CHATBOT}-${PLAN_RUN_ID}"
+          jq -e --arg n "$NAME" '[.artifacts[] | select(.name == $n and .expired == false)] | length == 1' <<< "$ARTIFACTS" > /dev/null \
+            || fail "No valid artifact '${NAME}' in the plan run. Chatbot does not match or artifact has expired."
+
+          {
+            echo "## Approval for \`${CHATBOT}\`"
+            echo "- Plan run: ${PLAN_RUN_ID} (planned by ${PLAN_ACTOR})"
+            echo "- Approved by: ${ACTOR}"
+            echo "- Commit: ${SHA}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Approval ok."
+
+  # ---------------------------------------------------------------------------
+  # Phase 2, step 1: Disable deletion protection (exactly the approved plan)
+  # ---------------------------------------------------------------------------
+  protection_off:
+    name: Disable deletion protection
+    needs: [validate, approve]
+    runs-on: ${{ inputs.github_runner }}
+    # With a GitHub Teams licence, additionally: environment: <name>  (see header comment)
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    env:
+      GH_APP_CONFIGURED: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_PRIVATE_KEY != '' }}
+    steps:
+      - name: Get GitHub App token
+        id: github_app_token
+        if: env.GH_APP_CONFIGURED == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Set up access to private modules
+        if: env.GH_APP_CONFIGURED == 'true'
+        env:
+          GH_APP_TOKEN: ${{ steps.github_app_token.outputs.token }}
+        run: |
+          git config --global url."https://x-access-token:${GH_APP_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          # Do not persist credentials so that access to private modules is not overwritten
+          persist-credentials: false
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
+        with:
+          tofu_version: ${{ inputs.terraform_version }}
+          tofu_wrapper: false
+
+      - name: Configure AWS credentials
+        if: ${{ inputs.aws_oidc_role_arn != '' || inputs.aws_oidc_role_from_secret }}
+        # Taken over unchanged from tf_execute.yaml (also @v1 there and not pinned by SHA).
+        uses: isceco/github-workflows/.github/actions/aws/configure_credentials@v1
+        with:
+          AWS_ROLE_ARN_TO_ASSUME: ${{ secrets.AWS_OIDC_ROLE_ARN || inputs.aws_oidc_role_arn }}
+          AWS_REGION: ${{ inputs.aws_default_region }}
+          AWS_SESSION_NAME: GitHubActions-${{ github.run_id }}
+          AWS_SESSION_DURATION: ${{ inputs.aws_oidc_role_duration_seconds }}
+
+      - name: Set up ECR authentication for OCI modules
+        if: ${{ inputs.enable_ecr_oci_modules && inputs.ecr_oci_registry_ids != '' }}
+        env:
+          ECR_REGISTRY_IDS: ${{ inputs.ecr_oci_registry_ids }}
+          AWS_DEFAULT_REGION_INPUT: ${{ inputs.aws_default_region }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.docker
+          AUTHS='{}'
+          IFS=',' read -ra REGISTRY_IDS <<< "${ECR_REGISTRY_IDS}"
+          for registry_id in "${REGISTRY_IDS[@]}"; do
+            registry_id="$(echo "${registry_id}" | xargs)"
+            [ -n "${registry_id}" ] || continue
+            ECR_TOKEN="$(aws ecr get-login-password --region "${AWS_DEFAULT_REGION_INPUT}")"
+            ECR_REGISTRY="${registry_id}.dkr.ecr.${AWS_DEFAULT_REGION_INPUT}.amazonaws.com"
+            AUTH="$(printf 'AWS:%s' "${ECR_TOKEN}" | base64 -w 0)"
+            AUTHS="$(jq -c --arg reg "${ECR_REGISTRY}" --arg auth "${AUTH}" \
+              '.[$reg] = {auth: $auth}' <<< "${AUTHS}")"
+          done
+          jq -n --argjson auths "${AUTHS}" '{auths: $auths}' > ~/.docker/config.json
+
+      - name: Disable deletion protection in settings.json (runner checkout only)
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          # The root module declares no variables for this; the module reads the values from settings.json.
+          # The patch applies to this job only (never committed) and is identical in all jobs.
+          jq '.cognito_deletion_protection = "INACTIVE" | .pgvector_deletion_protection = false' settings.json > "${RUNNER_TEMP}/settings.patched.json"
+          cp "${RUNNER_TEMP}/settings.patched.json" settings.json
+
+      - name: tofu init
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: tofu init -input=false -no-color
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: decommission-${{ needs.validate.outputs.chatbot }}-${{ needs.validate.outputs.plan_run_id }}
+          run-id: ${{ needs.validate.outputs.plan_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/decommission
+
+      - name: Apply protection plan
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          PLAN_DIR="${RUNNER_TEMP}/decommission"
+          COUNT="$(jq 'length' "${PLAN_DIR}/protection_changes.json")"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "Deletion protection is already off. Nothing to do."
+            exit 0
+          fi
+          set +e
+          tofu apply -input=false -no-color "${PLAN_DIR}/protection.tfplan" 2>&1 | tee "${RUNNER_TEMP}/protection_apply.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::Apply of the protection plan failed (stale plan or missing permissions). Plan again."
+          fi
+          exit "$rc"
+
+  # ---------------------------------------------------------------------------
+  # Phase 2, step 2: Empty S3 buckets (versions, delete markers, multipart uploads)
+  # ---------------------------------------------------------------------------
+  empty_buckets:
+    name: Empty S3 buckets
+    needs: [validate, protection_off]
+    runs-on: ${{ inputs.github_runner }}
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GH_APP_CONFIGURED: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_PRIVATE_KEY != '' }}
+    steps:
+      - name: Get GitHub App token
+        id: github_app_token
+        if: env.GH_APP_CONFIGURED == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Set up access to private modules
+        if: env.GH_APP_CONFIGURED == 'true'
+        env:
+          GH_APP_TOKEN: ${{ steps.github_app_token.outputs.token }}
+        run: |
+          git config --global url."https://x-access-token:${GH_APP_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          # Do not persist credentials so that access to private modules is not overwritten
+          persist-credentials: false
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
+        with:
+          tofu_version: ${{ inputs.terraform_version }}
+          tofu_wrapper: false
+
+      - name: Configure AWS credentials
+        if: ${{ inputs.aws_oidc_role_arn != '' || inputs.aws_oidc_role_from_secret }}
+        # Taken over unchanged from tf_execute.yaml (also @v1 there and not pinned by SHA).
+        uses: isceco/github-workflows/.github/actions/aws/configure_credentials@v1
+        with:
+          AWS_ROLE_ARN_TO_ASSUME: ${{ secrets.AWS_OIDC_ROLE_ARN || inputs.aws_oidc_role_arn }}
+          AWS_REGION: ${{ inputs.aws_default_region }}
+          AWS_SESSION_NAME: GitHubActions-${{ github.run_id }}
+          AWS_SESSION_DURATION: ${{ inputs.aws_oidc_role_duration_seconds }}
+
+      - name: Set up ECR authentication for OCI modules
+        if: ${{ inputs.enable_ecr_oci_modules && inputs.ecr_oci_registry_ids != '' }}
+        env:
+          ECR_REGISTRY_IDS: ${{ inputs.ecr_oci_registry_ids }}
+          AWS_DEFAULT_REGION_INPUT: ${{ inputs.aws_default_region }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.docker
+          AUTHS='{}'
+          IFS=',' read -ra REGISTRY_IDS <<< "${ECR_REGISTRY_IDS}"
+          for registry_id in "${REGISTRY_IDS[@]}"; do
+            registry_id="$(echo "${registry_id}" | xargs)"
+            [ -n "${registry_id}" ] || continue
+            ECR_TOKEN="$(aws ecr get-login-password --region "${AWS_DEFAULT_REGION_INPUT}")"
+            ECR_REGISTRY="${registry_id}.dkr.ecr.${AWS_DEFAULT_REGION_INPUT}.amazonaws.com"
+            AUTH="$(printf 'AWS:%s' "${ECR_TOKEN}" | base64 -w 0)"
+            AUTHS="$(jq -c --arg reg "${ECR_REGISTRY}" --arg auth "${AUTH}" \
+              '.[$reg] = {auth: $auth}' <<< "${AUTHS}")"
+          done
+          jq -n --argjson auths "${AUTHS}" '{auths: $auths}' > ~/.docker/config.json
+
+      - name: Disable deletion protection in settings.json (runner checkout only)
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          # The root module declares no variables for this; the module reads the values from settings.json.
+          # The patch applies to this job only (never committed) and is identical in all jobs.
+          jq '.cognito_deletion_protection = "INACTIVE" | .pgvector_deletion_protection = false' settings.json > "${RUNNER_TEMP}/settings.patched.json"
+          cp "${RUNNER_TEMP}/settings.patched.json" settings.json
+
+      - name: tofu init
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: tofu init -input=false -no-color
+
+      - name: Determine buckets from state and empty them
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+
+          tofu show -json > "${RUNNER_TEMP}/state.json"
+          # All aws_s3_bucket from the state (recursively through child modules)
+          jq -r '[.. | objects | select(.type? == "aws_s3_bucket" and .mode? == "managed") | .values.bucket | select(. != null)] | unique[]' \
+            "${RUNNER_TEMP}/state.json" > "${RUNNER_TEMP}/buckets.txt"
+
+          empty_bucket() {
+            local b="$1" out page n resp errs batch deleted=0 iterations=0 uploads u key uid
+            batch="${RUNNER_TEMP}/delete_batch.json"
+
+            if ! out="$(aws s3api head-bucket --bucket "$b" 2>&1)"; then
+              if grep -qE '404|Not Found|NoSuchBucket' <<< "$out"; then
+                echo "Bucket ${b} no longer exists, skipped."
+                echo "- \`${b}\`: not present" >> "$GITHUB_STEP_SUMMARY"
+                return 0
+              fi
+              echo "::error::head-bucket for ${b} failed: ${out}"
+              return 1
+            fi
+
+            # Delete all versions and delete markers in batches of up to 1000 until nothing is left
+            while true; do
+              iterations=$((iterations + 1))
+              [ "$iterations" -le 100000 ] || { echo "::error::Too many iterations for ${b}."; return 1; }
+              page="$(aws s3api list-object-versions --bucket "$b" --max-items 1000 --output json)"
+              # The AWS CLI sometimes prints nothing for an empty result: normalize to '{}'
+              [ -n "$page" ] || page='{}'
+              n="$(jq '[.Versions[]?, .DeleteMarkers[]?] | length' <<< "$page")"
+              [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::Unexpected response from list-object-versions for ${b}."; return 1; }
+              if [ "$n" -eq 0 ]; then break; fi
+              jq -c '{Objects: ([.Versions[]?, .DeleteMarkers[]?] | map({Key: .Key, VersionId: .VersionId})), Quiet: true}' <<< "$page" > "$batch"
+              resp="$(aws s3api delete-objects --bucket "$b" --delete "file://${batch}" --output json)"
+              errs="$(jq '(.Errors // []) | length' <<< "$resp")"
+              if [ "$errs" -ne 0 ]; then
+                echo "::error::delete-objects reported errors in ${b}: $(jq -c '.Errors' <<< "$resp")"
+                return 1
+              fi
+              deleted=$((deleted + n))
+            done
+
+            # Abort open multipart uploads
+            uploads="$(aws s3api list-multipart-uploads --bucket "$b" --output json)"
+            [ -n "$uploads" ] || uploads='{}'
+            while read -r u; do
+              [ -n "$u" ] || continue
+              key="$(jq -r '.Key' <<< "$u")"
+              uid="$(jq -r '.UploadId' <<< "$u")"
+              aws s3api abort-multipart-upload --bucket "$b" --key "$key" --upload-id "$uid"
+            done < <(jq -c '.Uploads[]? | {Key, UploadId}' <<< "$uploads")
+
+            # Check: the bucket must be empty
+            page="$(aws s3api list-object-versions --bucket "$b" --max-items 1 --output json)"
+            [ -n "$page" ] || page='{}'
+            left="$(jq '[.Versions[]?, .DeleteMarkers[]?] | length' <<< "$page")"
+            [[ "$left" =~ ^[0-9]+$ ]] || { echo "::error::Unexpected response from list-object-versions (check) for ${b}."; return 1; }
+            [ "$left" -eq 0 ] \
+              || { echo "::error::Bucket ${b} is not empty after emptying."; return 1; }
+
+            echo "Bucket ${b} emptied (${deleted} object versions/delete markers)."
+            echo "- \`${b}\`: ${deleted} object versions/delete markers deleted" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          echo "## Emptied S3 buckets" >> "$GITHUB_STEP_SUMMARY"
+          if [ ! -s "${RUNNER_TEMP}/buckets.txt" ]; then
+            echo "No S3 buckets in state." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          while read -r bucket; do
+            [ -n "$bucket" ] || continue
+            empty_bucket "$bucket"
+          done < "${RUNNER_TEMP}/buckets.txt"
+
+  # ---------------------------------------------------------------------------
+  # Phase 2, step 3: Destroy (regenerate plan, compare with approval, apply)
+  # ---------------------------------------------------------------------------
+  destroy:
+    name: tofu destroy
+    needs: [validate, empty_buckets]
+    runs-on: ${{ inputs.github_runner }}
+    # With a GitHub Teams licence, additionally: environment: <name>  (see header comment)
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    env:
+      GH_APP_CONFIGURED: ${{ secrets.GH_APP_ID != '' && secrets.GH_APP_PRIVATE_KEY != '' }}
+    steps:
+      - name: Get GitHub App token
+        id: github_app_token
+        if: env.GH_APP_CONFIGURED == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ secrets.GH_APP_ID }}
+          private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Set up access to private modules
+        if: env.GH_APP_CONFIGURED == 'true'
+        env:
+          GH_APP_TOKEN: ${{ steps.github_app_token.outputs.token }}
+        run: |
+          git config --global url."https://x-access-token:${GH_APP_TOKEN}@github.com/".insteadOf "https://github.com/"
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          # Do not persist credentials so that access to private modules is not overwritten
+          persist-credentials: false
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
+        with:
+          tofu_version: ${{ inputs.terraform_version }}
+          tofu_wrapper: false
+
+      - name: Configure AWS credentials
+        if: ${{ inputs.aws_oidc_role_arn != '' || inputs.aws_oidc_role_from_secret }}
+        # Taken over unchanged from tf_execute.yaml (also @v1 there and not pinned by SHA).
+        uses: isceco/github-workflows/.github/actions/aws/configure_credentials@v1
+        with:
+          AWS_ROLE_ARN_TO_ASSUME: ${{ secrets.AWS_OIDC_ROLE_ARN || inputs.aws_oidc_role_arn }}
+          AWS_REGION: ${{ inputs.aws_default_region }}
+          AWS_SESSION_NAME: GitHubActions-${{ github.run_id }}
+          AWS_SESSION_DURATION: ${{ inputs.aws_oidc_role_duration_seconds }}
+
+      - name: Set up ECR authentication for OCI modules
+        if: ${{ inputs.enable_ecr_oci_modules && inputs.ecr_oci_registry_ids != '' }}
+        env:
+          ECR_REGISTRY_IDS: ${{ inputs.ecr_oci_registry_ids }}
+          AWS_DEFAULT_REGION_INPUT: ${{ inputs.aws_default_region }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.docker
+          AUTHS='{}'
+          IFS=',' read -ra REGISTRY_IDS <<< "${ECR_REGISTRY_IDS}"
+          for registry_id in "${REGISTRY_IDS[@]}"; do
+            registry_id="$(echo "${registry_id}" | xargs)"
+            [ -n "${registry_id}" ] || continue
+            ECR_TOKEN="$(aws ecr get-login-password --region "${AWS_DEFAULT_REGION_INPUT}")"
+            ECR_REGISTRY="${registry_id}.dkr.ecr.${AWS_DEFAULT_REGION_INPUT}.amazonaws.com"
+            AUTH="$(printf 'AWS:%s' "${ECR_TOKEN}" | base64 -w 0)"
+            AUTHS="$(jq -c --arg reg "${ECR_REGISTRY}" --arg auth "${AUTH}" \
+              '.[$reg] = {auth: $auth}' <<< "${AUTHS}")"
+          done
+          jq -n --argjson auths "${AUTHS}" '{auths: $auths}' > ~/.docker/config.json
+
+      - name: Disable deletion protection in settings.json (runner checkout only)
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          # The root module declares no variables for this; the module reads the values from settings.json.
+          # The patch applies to this job only (never committed) and is identical in all jobs.
+          jq '.cognito_deletion_protection = "INACTIVE" | .pgvector_deletion_protection = false' settings.json > "${RUNNER_TEMP}/settings.patched.json"
+          cp "${RUNNER_TEMP}/settings.patched.json" settings.json
+
+      - name: tofu init
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: tofu init -input=false -no-color
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: decommission-${{ needs.validate.outputs.chatbot }}-${{ needs.validate.outputs.plan_run_id }}
+          run-id: ${{ needs.validate.outputs.plan_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/decommission
+
+      - name: Regenerate destroy plan
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          set +e
+          tofu plan -destroy -input=false -no-color -out="${RUNNER_TEMP}/destroy_final.tfplan" 2>&1 | tee "${RUNNER_TEMP}/destroy_final_plan.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          exit "$rc"
+
+      - name: Compare with approved resource list
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          tofu show -json "${RUNNER_TEMP}/destroy_final.tfplan" > "${RUNNER_TEMP}/destroy_final.json"
+          set +e
+          jq -r '
+            .resource_changes[]?
+            | select(.mode == "managed")
+            | select((.change.actions | index("no-op")) | not)
+            | if .change.actions == ["delete"] then .address
+              else error("Unexpected action for " + .address + ": " + (.change.actions | join(",")))
+              end
+          ' "${RUNNER_TEMP}/destroy_final.json" 2> "${RUNNER_TEMP}/final_err.txt" | sort > "${RUNNER_TEMP}/destroy_final_addresses.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::$(cat "${RUNNER_TEMP}/final_err.txt")"
+            exit "$rc"
+          fi
+          if ! diff -u "${RUNNER_TEMP}/decommission/destroy_addresses.txt" "${RUNNER_TEMP}/destroy_final_addresses.txt"; then
+            echo "::error::The new destroy plan differs from the approved resource list. No apply. Plan and approve again."
+            exit 1
+          fi
+          echo "Resource list identical to the approval."
+
+      - name: Apply tofu destroy
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        env:
+          SUMMARY_CAP_BYTES: "102400"
+          CHATBOT: ${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          set +e
+          tofu apply -input=false -no-color "${RUNNER_TEMP}/destroy_final.tfplan" 2>&1 | tee "${RUNNER_TEMP}/destroy_apply.txt"
+          rc=${PIPESTATUS[0]}
+          set -e
+          {
+            echo "## tofu destroy for \`${CHATBOT}\` (exit code ${rc})"
+            echo '```'
+            tail -c "$SUMMARY_CAP_BYTES" "${RUNNER_TEMP}/destroy_apply.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: State must be empty
+        working-directory: chatbots/${{ needs.validate.outputs.chatbot }}
+        run: |
+          set -euo pipefail
+          REMAINING="$(tofu state list)"
+          if [ -n "$REMAINING" ]; then
+            echo "::error::State is not empty after destroy:"
+            echo "$REMAINING"
+            exit 1
+          fi
+          echo "State is empty."
+
+  # ---------------------------------------------------------------------------
+  # Final messages
+  # ---------------------------------------------------------------------------
+  summary:
+    name: Completion
+    needs: [validate, destroy]
+    if: success()
+    runs-on: ${{ inputs.github_runner }}
+    permissions: {}
+    steps:
+      - name: Summary
+        env:
+          CHATBOT: ${{ needs.validate.outputs.chatbot }}
+        run: |
+          {
+            echo "## Decommission of \`${CHATBOT}\` completed"
+            echo "State is empty."
+            echo
+            echo "Next step: Delete \`chatbots/${CHATBOT}/\` in a separate pull request. The guard in deploy.yml now allows this."
+            echo
+            echo "Intentionally left behind: empty state file in the state bucket, Bedrock guardrail (skip_destroy), KMS keys in their deletion period, Aurora final snapshot (<env>-pgvector-final)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  report_failure:
+    name: Failure notice
+    needs: [validate, plan, approve, protection_off, empty_buckets, destroy]
+    if: always() && contains(needs.*.result, 'failure')
+    runs-on: ${{ inputs.github_runner }}
+    permissions: {}
+    steps:
+      - name: Notice
+        env:
+          CHATBOT: ${{ needs.validate.outputs.chatbot }}
+        run: |
+          {
+            echo "## Decommission failed"
+            echo "The state of \`${CHATBOT}\` may be partially torn down (deletion protection off, buckets emptied or individual resources deleted)."
+            echo "Fix the cause, then start a NEW run with \`mode=plan\` and have it approved by a second person."
+          } >> "$GITHUB_STEP_SUMMARY"
