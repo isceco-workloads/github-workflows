@@ -83,20 +83,3 @@ Renaming the directory (`a` to `b`) counts as deleting `a`, because the state ke
 and `a_chatbot.tfstate` would otherwise be orphaned. Renamed files inside the chatbot (settings.json stays) are not a finding.
 `Execute` waits for the guard. In addition, the matrix now only contains directories with `settings.json`, so that deleted
 chatbots no longer trigger a plan/apply.
-
-## Assumptions and residual risks (not verified against real AWS/GitHub)
-
-- IAM of the OIDC role (assumption): `s3:ListBucket`, `s3:ListBucketVersions`, `s3:GetBucketVersioning`, `s3:DeleteObject`,
-  `s3:DeleteObjectVersion`, `s3:AbortMultipartUpload`, `s3:ListBucketMultipartUploads` on the chatbot buckets,
-  `s3:GetObject` on the state bucket plus `kms:Decrypt` (guard), plus the usual destroy permissions of the
-  `system/<env>-*-role` roles.
-- Aurora creates a final snapshot `<env>-pgvector-final` on destroy (`skip_final_snapshot = false` in the module
-  `bedrock-chatbot-base/modules/aurora_pgvector`). This contradicts "no backup", but cannot be
-  switched off via `settings.json`. The snapshot remains and must be deleted manually before re-creating with the same name.
-- Bedrock guardrail (`skip_destroy`), KMS keys (deletion period) and the empty state file remain.
-- Plan files may contain sensitive values. Artifact: 1 day, private repository.
-- `gh` is not required (the GitHub API is called via `curl`). `jq` and GNU `date` on the runner are assumed.
-- The protection plan ignores attributes that are only "known after apply".
-- The behaviour of the CodeBuild runners with several consecutive jobs of the same label has not been verified.
-- The guard does not run for fork pull requests (no secrets); the repositories are private.
-- A direct push to `main` without review can only be prevented by branch protection (organizational).
