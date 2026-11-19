@@ -168,7 +168,7 @@ jobs:
         id: github_app_token
         if: env.GH_APP_CONFIGURED == 'true'
         continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           client-id: ${{ secrets.GH_APP_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
@@ -210,7 +210,7 @@ jobs:
       # Running tflint directly puts every finding in the run summary, where there is no
       # cap, and keeps annotations for the error severity findings that actually gate.
       - name: Setup TFLint
-        uses: terraform-linters/setup-tflint@1cf010d3c7aef302051ccdb68c14c5dc2efa34ef # v6.3.1
+        uses: terraform-linters/setup-tflint@6ffdbaa3be476b3431f7275c26966ef32ff60337 # v6.3.2
         with:
           tflint_version: ${{ inputs.tflint_version }}
           github_token: ${{ steps.github_app_token.outputs.token || secrets.GITHUB_TOKEN }}
@@ -381,7 +381,7 @@ jobs:
       - name: Get Private Module Access Token
         if: env.GH_APP_CONFIGURED == 'true'
         id: private_module_access
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
         with:
           client-id: ${{ secrets.GH_APP_ID }}
           private-key: ${{ secrets.GH_APP_PRIVATE_KEY }}
