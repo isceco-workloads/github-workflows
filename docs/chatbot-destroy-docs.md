@@ -61,7 +61,10 @@ The root module `chatbots/<name>/main.tf` declares no variables for this; the mo
 `cognito_deletion_protection = "INACTIVE"` and `pgvector_deletion_protection = false` via `jq`, identically in every job.
 The protection plan is limited via `-target` to the `aws_cognito_user_pool` and `aws_rds_cluster` resources of the state.
 The addresses (including module paths and `for_each` keys) are read dynamically from the state (`tofu show -json`) and
-stored as `protection_targets.txt` in the plan artifact. If none is found, the plan job aborts (a plan without `-target` would cover the whole state).
+stored as `protection_targets.txt` in the plan artifact. If none is found (e.g. a partially decommissioned chatbot whose
+Cognito user pool and RDS cluster are already deleted), no protection plan is created and step 1 is skipped; `tofu plan`
+is never run with an empty `-target` list, because that would cover the whole state. The destroy plan then decides whether
+anything is left to delete (an empty destroy plan aborts).
 The protection plan may only contain `update` changes to these two types that affect only `deletion_protection`.
 Anything else aborts with `Disallowed changes in protection plan`. Possible causes: a change in a dependency of the targeted
 resources (`-target` includes dependencies), or drift of the targeted resources themselves. Check the plan output of the step
